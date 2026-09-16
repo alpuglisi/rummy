@@ -86,6 +86,7 @@ class PPOTrainer:
         self.frozen_model = None
         self.evals_run = 0
         self.rng = np.random.default_rng()
+        self.last_aux = None
         self.teacher = SearchPolicy(self.model, self.device, worlds=config.distill_worlds,
                                     max_actions=config.distill_actions,
                                     seed=int(self.rng.integers(0, 2**31)))
@@ -184,9 +185,11 @@ class PPOTrainer:
                 self.writer.add_scalar("Search/TeacherAgreement", distill["agreement"], global_step)
                 self.writer.add_scalar("Search/RolloutSteps", distill["rollout_steps"], global_step)
                 self.writer.add_scalar("Perf/DistillSec", distill["seconds"], global_step)
+                self.writer.add_scalar("Search/TeacherBelief", float(self.teacher.belief), global_step)
             t_distill = time.time()
 
             actor_loss, critic_loss, distill_loss, aux = self.optimize(advantages, returns, distill)
+            self.last_aux = aux
             t_optimize = time.time()
 
             self.writer.add_scalar("Loss/Actor", actor_loss, global_step)
@@ -245,6 +248,11 @@ class PPOTrainer:
         envs = [self.envs.clone(i) for i in idx]
 
         self.model.eval()
+        # Belief-weighted worlds only once the opponent-hand head beats random guessing
+        # by a margin; a weak belief makes the worlds wrong in a consistent direction.
+        gain = self.last_aux["precision"] - self.last_aux["baseline"] if self.last_aux else 0.0
+        self.teacher.belief = bool(cfg.distill_belief and cfg.aux_coef > 0
+                                   and gain >= cfg.distill_belief_min_gain)
         self.teacher.reset_stats()
         stats = self.teacher.evaluate_actions(envs)
 
