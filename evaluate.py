@@ -20,6 +20,21 @@ class RandomPolicy:
         return np.array([self.rng.choice(mask.shape[1], p=p) for p in probs])
 
 
+class DeckOnlyPolicy:
+    """Always draws from the deck and discards at random: never penalised, so
+    games run to the deck or to someone going out."""
+
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
+
+    def act(self, obs, mask):
+        actions = np.empty(len(obs), dtype=np.int64)
+        for i in range(len(obs)):
+            legal = np.flatnonzero(mask[i])
+            actions[i] = 0 if obs[i, -3] == 0.0 and mask[i, 0] else self.rng.choice(legal)
+        return actions
+
+
 class ModelPolicy:
     def __init__(self, model, device, greedy=False):
         self.model = model
@@ -54,7 +69,11 @@ def play_matches(agent, opponent, num_games, seed=0):
 
     wins = draws = 0
     agent_penalties = 0
+    agent_draws = agent_deep_draws = 0
     game_lengths = np.zeros(num_games, dtype=np.int64)
+    # Agent's score sampled before its final step: meld points, excluding the
+    # opponent's leftover hand value that settle_terminal() adds at game end.
+    meld_points = np.zeros(num_games, dtype=np.float64)
 
     while alive.any():
         live = np.flatnonzero(alive)
@@ -69,7 +88,12 @@ def play_matches(agent, opponent, num_games, seed=0):
         if (~agent_turn).any():
             actions[~agent_turn] = opponent.act(obs[~agent_turn], mask[~agent_turn])
 
+        draw_phase = obs[:, -3] == 0.0
+        agent_draws += int((agent_turn & draw_phase).sum())
+        agent_deep_draws += int((agent_turn & draw_phase & (actions > 0)).sum())
+
         for j, i in enumerate(live):
+            meld_points[i] = envs[i].get_score(int(agent_player[i]))
             reward, done = envs[i].step(int(actions[j]))
             step_idx[i] += 1
             if not done:
@@ -81,13 +105,17 @@ def play_matches(agent, opponent, num_games, seed=0):
                 draws += 1
             elif (reward > 0) == actor_is_agent:
                 wins += 1
-            if actor_is_agent and reward == -50:
+            # A -50 with cards still in the deck is the meld-failure penalty; at deck
+            # exhaustion -50 can also be a legitimate score difference.
+            if actor_is_agent and reward == -50 and envs[i].get_state()[-2] < 1.0:
                 agent_penalties += 1
 
     return {
         "win_rate": wins / num_games,
         "draw_rate": draws / num_games,
         "penalty_rate": agent_penalties / num_games,
+        "deep_draw_rate": agent_deep_draws / max(agent_draws, 1),
+        "meld_points": float(meld_points.mean()),
         "mean_turns": float(game_lengths.mean()) / 2,
     }
 
@@ -111,14 +139,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     baseline = ModelPolicy(load_model(args.checkpoints[0], device), device, args.greedy)
     random_policy = RandomPolicy(args.seed)
+    deck_only = DeckOnlyPolicy(args.seed)
 
-    print(f"{'checkpoint':<40} {'vs random':>10} {'vs baseline':>12} {'draws':>7} {'penalty':>8} {'turns':>6}")
+    print(f"baseline: {os.path.basename(args.checkpoints[0])}   "
+          f"(deep-draw %, meld pts and turns are from games vs deck-only)")
+    print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs base':>8} {'draws':>6} "
+          f"{'penalty':>8} {'deep-draw':>10} {'meld pts':>9} {'turns':>6}")
     for path in args.checkpoints:
         agent = ModelPolicy(load_model(path, device), device, args.greedy)
         vs_random = play_matches(agent, random_policy, args.games, args.seed)
-        vs_base = play_matches(agent, baseline, args.games, args.seed + 1)
-        print(f"{os.path.basename(path):<40} {vs_random['win_rate']:>10.1%} {vs_base['win_rate']:>12.1%} "
-              f"{vs_base['draw_rate']:>7.1%} {vs_random['penalty_rate']:>8.1%} {vs_random['mean_turns']:>6.1f}")
+        vs_deck = play_matches(agent, deck_only, args.games, args.seed + 1)
+        vs_base = play_matches(agent, baseline, args.games, args.seed + 2)
+        print(f"{os.path.basename(path):<28} {vs_random['win_rate']:>9.1%} {vs_deck['win_rate']:>8.1%} "
+              f"{vs_base['win_rate']:>8.1%} {vs_base['draw_rate']:>6.1%} {vs_deck['penalty_rate']:>8.1%} "
+              f"{vs_deck['deep_draw_rate']:>10.1%} {vs_deck['meld_points']:>9.1f} {vs_deck['mean_turns']:>6.1f}")
 
 
 if __name__ == "__main__":

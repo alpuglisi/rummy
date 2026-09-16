@@ -1,3 +1,4 @@
+import copy
 import os
 import torch
 import torch.optim as optim
@@ -7,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
-from evaluate import ModelPolicy, RandomPolicy, play_matches
+from evaluate import DeckOnlyPolicy, ModelPolicy, RandomPolicy, play_matches
 
 class RolloutBuffer:
     def __init__(self, cfg: PPOConfig, device: torch.device):
@@ -66,6 +67,8 @@ class PPOTrainer:
         self.buffer = RolloutBuffer(config, self.device)
         
         self.writer = SummaryWriter(log_dir="runs/rummy_ppo")
+        self.frozen_model = None
+        self.evals_run = 0
         
     def train(self):
         state, mask = self.envs.reset()
@@ -180,17 +183,35 @@ class PPOTrainer:
 
     def evaluate(self, global_step):
         self.model.eval()
-        stats = play_matches(
-            ModelPolicy(self.model, self.device), RandomPolicy(global_step),
-            self.cfg.eval_games, seed=global_step,
-        )
+        agent = ModelPolicy(self.model, self.device)
+        n = self.cfg.eval_games
+
+        vs_random = play_matches(agent, RandomPolicy(global_step), n, seed=global_step)
+        vs_deck = play_matches(agent, DeckOnlyPolicy(global_step), n, seed=global_step + 1)
+        self.writer.add_scalar("Eval/WinRate_vs_Random", vs_random["win_rate"], global_step)
+        self.writer.add_scalar("Eval/WinRate_vs_DeckOnly", vs_deck["win_rate"], global_step)
+        self.writer.add_scalar("Eval/DrawRate_vs_DeckOnly", vs_deck["draw_rate"], global_step)
+        self.writer.add_scalar("Eval/PenaltyRate", vs_deck["penalty_rate"], global_step)
+        self.writer.add_scalar("Eval/DeepDrawRate", vs_deck["deep_draw_rate"], global_step)
+        self.writer.add_scalar("Eval/MeldPoints", vs_deck["meld_points"], global_step)
+        self.writer.add_scalar("Eval/MeanTurns", vs_deck["mean_turns"], global_step)
+        line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | vs deck-only {vs_deck['win_rate']:.1%} "
+                f"(draws {vs_deck['draw_rate']:.1%}) | deep-draw {vs_deck['deep_draw_rate']:.1%} | "
+                f"meld pts {vs_deck['meld_points']:.1f} | {vs_deck['mean_turns']:.1f} turns")
+
+        # Win rate against a snapshot of this policy from frozen_refresh evals ago;
+        # above 50% means self-play is still making progress.
+        if self.frozen_model is not None:
+            vs_frozen = play_matches(agent, ModelPolicy(self.frozen_model, self.device), n, seed=global_step + 2)
+            score = vs_frozen["win_rate"] + 0.5 * vs_frozen["draw_rate"]
+            self.writer.add_scalar("Eval/Score_vs_Frozen", score, global_step)
+            line += f" | vs frozen {score:.1%}"
+        if self.evals_run % self.cfg.frozen_refresh == 0:
+            self.frozen_model = copy.deepcopy(self.model)
+        self.evals_run += 1
+
         self.model.train()
-        self.writer.add_scalar("Eval/WinRate_vs_Random", stats["win_rate"], global_step)
-        self.writer.add_scalar("Eval/DrawRate_vs_Random", stats["draw_rate"], global_step)
-        self.writer.add_scalar("Eval/PenaltyRate", stats["penalty_rate"], global_step)
-        self.writer.add_scalar("Eval/MeanTurns", stats["mean_turns"], global_step)
-        print(f"  Eval vs random: win {stats['win_rate']:.1%}, penalty {stats['penalty_rate']:.1%}, "
-              f"{stats['mean_turns']:.1f} turns")
+        print(line)
 
     def save_checkpoint(self, path: str):
         directory = os.path.dirname(path)

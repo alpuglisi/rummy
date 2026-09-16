@@ -25,6 +25,7 @@ class PPOConfig:
     # Evaluation (win rate vs a random opponent, logged to TensorBoard)
     eval_interval: int = 5     # Run every N PPO updates
     eval_games: int = 256
+    frozen_refresh: int = 4    # Re-snapshot the frozen self-play opponent every N evals
 
     # System
     device: str = "cuda"
