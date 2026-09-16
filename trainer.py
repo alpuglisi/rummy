@@ -83,6 +83,7 @@ class PPOTrainer:
         global_step = 0
         update = 0
         while global_step < self.cfg.total_timesteps:
+            t_start = time.time()
             for _ in range(self.cfg.num_steps):
                 with torch.no_grad():
                     action, logprob, value = self.model.get_action(state, mask)
@@ -97,26 +98,37 @@ class PPOTrainer:
                 done = next_done.to(self.device)
                 global_step += self.cfg.num_envs
 
+            t_rollout = time.time()
             with torch.no_grad():
                 _, next_value = self.model(state, mask)
                 next_value = next_value.squeeze(-1)
-            
+
             advantages, returns = self.buffer.compute_advantages(
                 next_value, state, done, self.cfg.gamma, self.cfg.gae_lambda
             )
-            
+
             actor_loss, critic_loss = self.optimize(advantages, returns)
-            
+            t_optimize = time.time()
+
             self.writer.add_scalar("Loss/Actor", actor_loss, global_step)
             self.writer.add_scalar("Loss/Critic", critic_loss, global_step)
             self.writer.add_scalar("Reward/Average_Return", returns.mean().item(), global_step)
-            
+
             self.buffer.clear()
-            print(f"Global Step: {global_step} / {self.cfg.total_timesteps}")
+            samples = self.cfg.num_envs * self.cfg.num_steps
+            train_sps = samples / (t_optimize - t_start)
+            print(f"Global Step: {global_step} / {self.cfg.total_timesteps}  ({train_sps:,.0f} steps/s)")
 
             update += 1
             if update % self.cfg.eval_interval == 0:
                 self.evaluate(global_step)
+            t_end = time.time()
+
+            self.writer.add_scalar("Perf/RolloutSec", t_rollout - t_start, global_step)
+            self.writer.add_scalar("Perf/OptimizeSec", t_optimize - t_rollout, global_step)
+            self.writer.add_scalar("Perf/EvalSec", t_end - t_optimize, global_step)
+            self.writer.add_scalar("Perf/TrainStepsPerSec", train_sps, global_step)
+            self.writer.add_scalar("Perf/StepsPerSec", samples / (t_end - t_start), global_step)
             
             current_millions = global_step // 1_000_000
 
