@@ -33,5 +33,11 @@ class PPOConfig:
     eval_games: int = 1000
     frozen_refresh: int = 4    # Re-snapshot the frozen self-play opponent every N evals
 
+    # Search diagnostics (model + Monte Carlo search vs the model alone)
+    search_eval_every: int = 4 # Run every N evals; costlier than the plain evals
+    search_eval_games: int = 100
+    search_worlds: int = 16
+    search_actions: int = 4
+
     # System
     device: str = "cuda"

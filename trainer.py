@@ -1,5 +1,6 @@
 import copy
 import os
+import time
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
 from evaluate import DeckOnlyPolicy, GreedyPolicy, ModelPolicy, RandomPolicy, play_matches
+from search import SearchPolicy
 
 class RolloutBuffer:
     def __init__(self, cfg: PPOConfig, device: torch.device):
@@ -218,10 +220,33 @@ class PPOTrainer:
             line += f" | vs frozen {score:.1%}"
         if self.evals_run % self.cfg.frozen_refresh == 0:
             self.frozen_model = copy.deepcopy(self.model)
+        if self.cfg.search_eval_every and self.evals_run % self.cfg.search_eval_every == 0:
+            line += self.evaluate_search(agent, global_step)
         self.evals_run += 1
 
         self.model.train()
         print(line)
+
+    def evaluate_search(self, plain, global_step):
+        cfg = self.cfg
+        search = SearchPolicy(self.model, self.device, worlds=cfg.search_worlds,
+                              max_actions=cfg.search_actions, seed=global_step)
+        t0 = time.time()
+        vs_plain = play_matches(search, plain, cfg.search_eval_games, seed=global_step + 4)
+        vs_greedy = play_matches(search, GreedyPolicy(global_step), cfg.search_eval_games, seed=global_step + 5)
+        seconds_per_game = (time.time() - t0) / (2 * cfg.search_eval_games)
+        stats = search.stats()
+
+        plain_score = vs_plain["win_rate"] + 0.5 * vs_plain["draw_rate"]
+        greedy_score = vs_greedy["win_rate"] + 0.5 * vs_greedy["draw_rate"]
+        self.writer.add_scalar("Search/Score_vs_Plain", plain_score, global_step)
+        self.writer.add_scalar("Search/Score_vs_Greedy", greedy_score, global_step)
+        self.writer.add_scalar("Search/Agreement", stats["agreement"], global_step)
+        self.writer.add_scalar("Search/ValueGap", stats["value_gap"], global_step)
+        self.writer.add_scalar("Search/SecondsPerGame", seconds_per_game, global_step)
+        return (f"\n  Search({cfg.search_worlds}x{cfg.search_actions}): vs plain {plain_score:.1%} | "
+                f"vs greedy {greedy_score:.1%} | agrees with model {stats['agreement']:.1%} | "
+                f"value gap {stats['value_gap']:+.1f} | {seconds_per_game:.2f}s/game")
 
     def save_checkpoint(self, path: str):
         directory = os.path.dirname(path)

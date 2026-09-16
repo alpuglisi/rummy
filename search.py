@@ -27,6 +27,21 @@ class SearchPolicy:
         self.max_actions = max_actions
         self.rng = np.random.default_rng(seed)
         self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 1)
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.decisions = 0
+        self.agreements = 0          # search picked the model's own top choice
+        self.value_gap = 0.0         # mean outcome of search's pick minus the model's pick
+        self.rollouts = 0
+
+    def stats(self):
+        n = max(self.decisions, 1)
+        return {
+            "agreement": self.agreements / n,
+            "value_gap": self.value_gap / n,
+            "rollouts_per_decision": self.rollouts / n,
+        }
 
     @torch.no_grad()
     def _logits(self, obs, mask):
@@ -99,4 +114,13 @@ class SearchPolicy:
 
     def act_envs(self, envs):
         stats = self.evaluate_actions(envs)
-        return np.array([max(s, key=lambda a: s[a][0]) for s in stats], dtype=np.int64)
+        choices = []
+        for s in stats:
+            model_pick = next(iter(s))               # candidates are ordered by model probability
+            best = max(s, key=lambda a: s[a][0])
+            choices.append(best)
+            self.decisions += 1
+            self.agreements += int(best == model_pick)
+            self.value_gap += s[best][0] - s[model_pick][0]
+            self.rollouts += sum(n for _, n in s.values())
+        return np.array(choices, dtype=np.int64)
