@@ -481,6 +481,13 @@ VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_thre
     pool = make_pool(num_threads, num_envs);
 }
 
+py::array_t<int32_t> VectorizedRummyEnv::current_players() const {
+    py::array_t<int32_t> out(size());
+    int32_t* o = out.mutable_data();
+    for (int i = 0; i < size(); i++) o[i] = envs[i].get_current_player();
+    return out;
+}
+
 py::tuple VectorizedRummyEnv::reset() {
     const int n = size();
     py::array_t<float> states({n, OBS_SPACE_SIZE});
@@ -624,6 +631,7 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)
         .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
         .def("get", &VectorizedRummyEnv::get, "Copy of live game i.")
+        .def("current_players", &VectorizedRummyEnv::current_players, "Player to move in each game (1 or 2).")
         .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,obs], masks[N,105] bool).")
         .def("step", &VectorizedRummyEnv::step,
              "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");

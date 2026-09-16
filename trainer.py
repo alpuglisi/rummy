@@ -10,7 +10,9 @@ from torch.utils.tensorboard import SummaryWriter
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
-from env.vectorized_env import blank_known
+import glob
+
+from env.vectorized_env import adapt_obs, blank_known
 from evaluate import DeckOnlyPolicy, GreedyPolicy, ModelPolicy, RandomPolicy, play_matches
 from search import SearchPolicy
 
@@ -23,10 +25,14 @@ class RolloutBuffer:
         self.rewards = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
         self.values = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
         self.dones = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.bool).to(device)
+        # False where a pool opponent chose the action: excluded from the policy loss.
+        self.valid = torch.ones((cfg.num_steps, cfg.num_envs), dtype=torch.bool).to(device)
         self.step = 0
         self.device = device
 
-    def store(self, state, mask, action, logprob, reward, value, done):
+    def store(self, state, mask, action, logprob, reward, value, done, valid=None):
+        if valid is not None:
+            self.valid[self.step] = valid.to(self.device)
         self.states[self.step] = state.to(self.device)
         self.masks[self.step] = mask.to(self.device)
         self.actions[self.step] = action.to(self.device)
@@ -79,29 +85,83 @@ class PPOTrainer:
         self.teacher = SearchPolicy(self.model, self.device, worlds=config.distill_worlds,
                                     max_actions=config.distill_actions,
                                     seed=int(self.rng.integers(0, 2**31)))
+
+        # Opponent pool: frozen policies; each game is either pure self-play
+        # (opponent -1) or has one pool member controlling one seat.
+        self.pool = []
+        if config.pool_fraction > 0 and config.pool_init_dir and os.path.isdir(config.pool_init_dir):
+            for path in sorted(glob.glob(os.path.join(config.pool_init_dir, "*.pth"))):
+                model = RummyActorCritic.from_state_dict(torch.load(path, map_location=self.device))
+                self.pool.append(model.to(self.device).eval())
+            self.pool = self.pool[-config.pool_size:]
+            if self.pool:
+                print(f"Opponent pool seeded with {len(self.pool)} checkpoint(s) from {config.pool_init_dir}/")
+        self.opponent = torch.full((config.num_envs,), -1, dtype=torch.long, device=self.device)
+        self.opponent_seat = torch.ones(config.num_envs, dtype=torch.int32, device=self.device)
+
+    def assign_opponents(self, which):
+        """Pick a pool opponent (or none) and a seat for the games in `which`."""
+        n = int(which.sum())
+        if n == 0 or not self.pool or self.cfg.pool_fraction <= 0:
+            self.opponent[which] = -1
+            return
+        use_pool = torch.rand(n, device=self.device) < self.cfg.pool_fraction
+        ids = torch.randint(len(self.pool), (n,), device=self.device)
+        self.opponent[which] = torch.where(use_pool, ids, torch.full_like(ids, -1))
+        self.opponent_seat[which] = torch.randint(1, 3, (n,), device=self.device, dtype=torch.int32)
+
+    @torch.no_grad()
+    def pool_actions(self, action, state, mask, players):
+        """Override the learner's actions where a pool opponent is to move; return the learner-turn mask."""
+        pool_turn = (self.opponent >= 0) & (players == self.opponent_seat)
+        if pool_turn.any():
+            for pid in torch.unique(self.opponent[pool_turn]).tolist():
+                idx = torch.nonzero(pool_turn & (self.opponent == pid)).squeeze(1)
+                model = self.pool[pid]
+                logits, _ = model(adapt_obs(state[idx], model.obs_dim), mask[idx])
+                action[idx] = torch.distributions.Categorical(logits=logits).sample()
+        return ~pool_turn
+
+    def anneal_lr(self, global_step):
+        cfg = self.cfg
+        progress = global_step / cfg.total_timesteps
+        frac = min(1.0, max(0.0, (progress - cfg.lr_anneal_start) / max(1e-9, 1.0 - cfg.lr_anneal_start)))
+        lr = cfg.learning_rate + (cfg.lr_final - cfg.learning_rate) * frac
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
         
     def train(self):
         state, mask = self.envs.reset()
         state = state.to(self.device)
         mask = mask.to(self.device)
         done = torch.zeros(self.cfg.num_envs, dtype=torch.bool).to(self.device)
-        
+        players = self.envs.current_players().to(self.device)
+        self.assign_opponents(torch.ones(self.cfg.num_envs, dtype=torch.bool, device=self.device))
+
         global_step = 0
         update = 0
         while global_step < self.cfg.total_timesteps:
             t_start = time.time()
+            lr = self.anneal_lr(global_step)
+            learner_steps = 0
             for _ in range(self.cfg.num_steps):
                 with torch.no_grad():
                     action, logprob, value = self.model.get_action(state, mask)
-                
+                valid = self.pool_actions(action, state, mask, players)
+                learner_steps += int(valid.sum())
+
                 next_state, next_mask, reward, next_done = self.envs.step(action)
                 reward = reward * self.cfg.reward_scale
 
-                self.buffer.store(state, mask, action, logprob, reward, value, done)
-                
+                self.buffer.store(state, mask, action, logprob, reward, value, done, valid)
+
                 state = next_state.to(self.device)
                 mask = next_mask.to(self.device)
                 done = next_done.to(self.device)
+                players = self.envs.current_players().to(self.device)
+                if done.any():
+                    self.assign_opponents(done)
                 global_step += self.cfg.num_envs
 
             t_rollout = time.time()
@@ -128,6 +188,10 @@ class PPOTrainer:
             self.writer.add_scalar("Loss/Critic", critic_loss, global_step)
             if distill is not None:
                 self.writer.add_scalar("Loss/Distill", distill_loss, global_step)
+            self.writer.add_scalar("Train/LearningRate", lr, global_step)
+            self.writer.add_scalar("Pool/Size", len(self.pool), global_step)
+            self.writer.add_scalar("Pool/LearnerStepFraction",
+                                   learner_steps / (self.cfg.num_steps * self.cfg.num_envs), global_step)
             self.writer.add_scalar("Reward/Average_Return", returns.mean().item(), global_step)
 
             self.buffer.clear()
@@ -136,6 +200,9 @@ class PPOTrainer:
             print(f"Global Step: {global_step} / {self.cfg.total_timesteps}  ({train_sps:,.0f} steps/s)")
 
             update += 1
+            if self.cfg.pool_fraction > 0 and update % self.cfg.pool_add_every == 0:
+                self.pool.append(copy.deepcopy(self.model).eval())
+                self.pool = self.pool[-self.cfg.pool_size:]
             if update % self.cfg.eval_interval == 0:
                 self.evaluate(global_step)
             t_end = time.time()
@@ -209,8 +276,10 @@ class PPOTrainer:
         b_logprobs = self.buffer.logprobs.view(-1)
         b_advantages = advantages.view(-1)
         b_returns = returns.view(-1)
+        b_valid = self.buffer.valid.view(-1).float()
 
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        valid_adv = b_advantages[b_valid > 0]
+        b_advantages = (b_advantages - valid_adv.mean()) / (valid_adv.std() + 1e-8)
 
         num_samples = b_states.shape[0]
         total_a_loss = 0
@@ -229,19 +298,21 @@ class PPOTrainer:
                 mb_old_logprobs = b_logprobs[idx]
                 mb_advantages = b_advantages[idx]
                 mb_returns = b_returns[idx]
+                mb_valid = b_valid[idx]
+                n_valid = mb_valid.sum().clamp(min=1.0)
 
                 logits, new_values = self.model(mb_states, mb_masks)
                 dist = torch.distributions.Categorical(logits=logits)
 
                 new_logprobs = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
+                entropy = (dist.entropy() * mb_valid).sum() / n_valid
 
                 logratio = new_logprobs - mb_old_logprobs
                 ratio = logratio.exp()
 
                 pg_loss1 = mb_advantages * ratio
                 pg_loss2 = mb_advantages * torch.clamp(ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef)
-                actor_loss = -torch.min(pg_loss1, pg_loss2).mean()
+                actor_loss = -(torch.min(pg_loss1, pg_loss2) * mb_valid).sum() / n_valid
 
                 critic_loss = F.mse_loss(new_values.squeeze(-1), mb_returns)
 

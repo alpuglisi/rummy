@@ -18,6 +18,16 @@ class PPOConfig:
     # Training Parameters
     total_timesteps: int = 100_000_000
     learning_rate: float = 3e-4
+    lr_final: float = 1e-5           # Linear anneal target; reached at the end of the run
+    lr_anneal_start: float = 0.5     # Fraction of the run after which annealing begins
+
+    # Opponent pool: a fraction of games are played against frozen earlier
+    # policies instead of the live policy, so self-play cannot overfit to
+    # itself. The learner only trains on its own moves in those games.
+    pool_fraction: float = 0.5       # Fraction of games with a pool opponent; 0 = pure self-play
+    pool_size: int = 8               # Snapshots kept (oldest dropped)
+    pool_add_every: int = 100        # Updates between snapshots of the live policy
+    pool_init_dir: str = "archive"   # Checkpoints loaded into the pool at start, if the directory exists
     epochs: int = 4
     batch_size: int = 2048
     
@@ -43,10 +53,10 @@ class PPOConfig:
     # Expert iteration: every distill_every updates, run the search on live
     # training positions (rollouts always play to the end of the game) and pull
     # the policy toward the search's action distribution.
-    distill_every: int = 8
+    distill_every: int = 4
     distill_positions: int = 256
-    distill_worlds: int = 64       # +-7 pts per candidate outcome; 16 worlds was +-15, noisier than the temperature
-    distill_actions: int = 4
+    distill_worlds: int = 128      # +-5 pts per candidate outcome; 16 worlds was +-15, noisier than the temperature
+    distill_actions: int = 6
     distill_coef: float = 0.5        # Weight of the distillation loss next to the PPO loss; 0 disables
     distill_temperature: float = 15.0  # Points; softmax over candidate outcomes / temperature
 

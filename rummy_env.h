@@ -154,6 +154,7 @@ public:
 
     int size() const { return static_cast<int>(envs.size()); }
     RummyEnv get(int i) const { return envs.at(i); }
+    py::array_t<int32_t> current_players() const;
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
 };

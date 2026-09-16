@@ -21,11 +21,14 @@ def blank_known(states):
 
 def adapt_obs(states, obs_dim):
     """Project the engine observation onto an older layout (a checkpoint
-    trained without the unseen channel expects the five channels + scalars)."""
+    trained without the unseen channel expects the five channels + scalars).
+    Works on numpy arrays and torch tensors."""
     if states.shape[-1] == obs_dim:
         return states
     if obs_dim == 5 * 52 + 6 and states.shape[-1] == CHANNELS_END + 6:
-        return np.concatenate([states[..., :5 * 52], states[..., CHANNELS_END:]], axis=-1)
+        if isinstance(states, np.ndarray):
+            return np.concatenate([states[..., :5 * 52], states[..., CHANNELS_END:]], axis=-1)
+        return torch.cat([states[..., :5 * 52], states[..., CHANNELS_END:]], dim=-1)
     raise ValueError(f"cannot adapt observation of width {states.shape[-1]} to a model expecting {obs_dim}")
 
 
@@ -72,6 +75,9 @@ class VectorizedRummyEnv:
     def clone(self, i):
         """Independent copy of live game i, for search."""
         return self._env.get(int(i))
+
+    def current_players(self):
+        return torch.from_numpy(self._env.current_players())
 
     def close(self):
         pass
