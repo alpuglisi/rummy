@@ -45,6 +45,11 @@ class RummyActorCritic(nn.Module):
         self.critic_fc = nn.Linear(hidden_size, head)
         self.critic_value = nn.Linear(head, 1)
 
+        # Auxiliary head: which cards the opponent holds. Trained against the
+        # engine's true state so the trunk learns to infer hidden information
+        # from public play; unused at inference.
+        self.aux_opponent = nn.Linear(hidden_size, 52)
+
     def trunk(self, state):
         if self.residual:
             x = F.relu(self.input(state))
@@ -56,9 +61,7 @@ class RummyActorCritic(nn.Module):
             x = F.relu(getattr(self, f"shared_fc{i}")(x))
         return x
 
-    def forward(self, state, action_mask=None):
-        x = self.trunk(state)
-
+    def heads(self, x, action_mask=None):
         c = F.relu(self.critic_fc(x))
         value = self.critic_value(c)
 
@@ -69,6 +72,14 @@ class RummyActorCritic(nn.Module):
             logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
 
         return logits, value
+
+    def forward(self, state, action_mask=None):
+        return self.heads(self.trunk(state), action_mask)
+
+    def forward_with_aux(self, state, action_mask=None):
+        x = self.trunk(state)
+        logits, value = self.heads(x, action_mask)
+        return logits, value, self.aux_opponent(x)
 
     def get_action(self, state, action_mask):
         logits, value = self.forward(state, action_mask)
@@ -88,5 +99,9 @@ class RummyActorCritic(nn.Module):
             hidden_size, obs_dim = state_dict["shared_fc1.weight"].shape
             num_layers = sum(1 for k in state_dict if k.startswith("shared_fc") and k.endswith(".weight"))
             model = cls(obs_dim, action_dim, hidden_size, num_layers, residual=False)
-        model.load_state_dict(state_dict)
+        # Checkpoints saved before the auxiliary head exist without it; it is not needed to play.
+        result = model.load_state_dict(state_dict, strict=False)
+        unexpected_missing = [k for k in result.missing_keys if not k.startswith("aux_opponent.")]
+        if unexpected_missing or result.unexpected_keys:
+            raise RuntimeError(f"checkpoint mismatch: missing {unexpected_missing}, unexpected {result.unexpected_keys}")
         return model

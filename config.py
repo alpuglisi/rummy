@@ -58,6 +58,7 @@ class PPOConfig:
     distill_worlds: int = 128      # +-5 pts per candidate outcome; 16 worlds was +-15, noisier than the temperature
     distill_actions: int = 6
     distill_coef: float = 0.5        # Weight of the distillation loss next to the PPO loss; 0 disables
+    aux_coef: float = 0.5            # Weight of the opponent-hand prediction loss; 0 disables
     distill_temperature: float = 15.0  # Points; softmax over candidate outcomes / temperature
 
     # System

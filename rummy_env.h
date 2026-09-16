@@ -102,6 +102,11 @@ public:
 
     const std::vector<float>& observation() const { return observation_buffer; }
     std::vector<uint8_t> legal_mask() { return compute_legal_mask(); }
+
+    // Ground truth for the auxiliary prediction target: the cards held by the
+    // player who is not to move. Training-time only; never part of the observation.
+    void opponent_hand(bool* out) const;
+    py::array_t<bool> get_opponent_hand() const;
 };
 
 // Persistent worker threads. run(fn) calls fn(worker_index, num_workers) on
@@ -155,6 +160,7 @@ public:
     int size() const { return static_cast<int>(envs.size()); }
     RummyEnv get(int i) const { return envs.at(i); }
     py::array_t<int32_t> current_players() const;
+    py::array_t<bool> opponent_hands() const;
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
 };

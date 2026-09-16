@@ -12,7 +12,7 @@ from models.ppo_network import RummyActorCritic
 from config import PPOConfig
 import glob
 
-from env.vectorized_env import adapt_obs, blank_known
+from env.vectorized_env import KNOWN_CARDS, UNSEEN_CARDS, adapt_obs, blank_known
 from evaluate import DeckOnlyPolicy, GreedyPolicy, ModelPolicy, RandomPolicy, play_matches
 from search import SearchPolicy
 
@@ -27,12 +27,16 @@ class RolloutBuffer:
         self.dones = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.bool).to(device)
         # False where a pool opponent chose the action: excluded from the policy loss.
         self.valid = torch.ones((cfg.num_steps, cfg.num_envs), dtype=torch.bool).to(device)
+        # Auxiliary target: the opponent's true hand at each stored state.
+        self.opp_hands = torch.zeros((cfg.num_steps, cfg.num_envs, 52), dtype=torch.bool).to(device)
         self.step = 0
         self.device = device
 
-    def store(self, state, mask, action, logprob, reward, value, done, valid=None):
+    def store(self, state, mask, action, logprob, reward, value, done, valid=None, opp_hand=None):
         if valid is not None:
             self.valid[self.step] = valid.to(self.device)
+        if opp_hand is not None:
+            self.opp_hands[self.step] = opp_hand.to(self.device)
         self.states[self.step] = state.to(self.device)
         self.masks[self.step] = mask.to(self.device)
         self.actions[self.step] = action.to(self.device)
@@ -150,11 +154,12 @@ class PPOTrainer:
                     action, logprob, value = self.model.get_action(state, mask)
                 valid = self.pool_actions(action, state, mask, players)
                 learner_steps += int(valid.sum())
+                opp_hand = self.envs.opponent_hands()
 
                 next_state, next_mask, reward, next_done = self.envs.step(action)
                 reward = reward * self.cfg.reward_scale
 
-                self.buffer.store(state, mask, action, logprob, reward, value, done, valid)
+                self.buffer.store(state, mask, action, logprob, reward, value, done, valid, opp_hand)
 
                 state = next_state.to(self.device)
                 mask = next_mask.to(self.device)
@@ -181,7 +186,7 @@ class PPOTrainer:
                 self.writer.add_scalar("Perf/DistillSec", distill["seconds"], global_step)
             t_distill = time.time()
 
-            actor_loss, critic_loss, distill_loss = self.optimize(advantages, returns, distill)
+            actor_loss, critic_loss, distill_loss, aux = self.optimize(advantages, returns, distill)
             t_optimize = time.time()
 
             self.writer.add_scalar("Loss/Actor", actor_loss, global_step)
@@ -189,6 +194,10 @@ class PPOTrainer:
             if distill is not None:
                 self.writer.add_scalar("Loss/Distill", distill_loss, global_step)
             self.writer.add_scalar("Train/LearningRate", lr, global_step)
+            if self.cfg.aux_coef > 0:
+                self.writer.add_scalar("Aux/OpponentHandLoss", aux["loss"], global_step)
+                self.writer.add_scalar("Aux/TopKPrecision", aux["precision"], global_step)
+                self.writer.add_scalar("Aux/TopKBaseline", aux["baseline"], global_step)
             self.writer.add_scalar("Pool/Size", len(self.pool), global_step)
             self.writer.add_scalar("Pool/LearnerStepFraction",
                                    learner_steps / (self.cfg.num_steps * self.cfg.num_envs), global_step)
@@ -277,6 +286,7 @@ class PPOTrainer:
         b_advantages = advantages.view(-1)
         b_returns = returns.view(-1)
         b_valid = self.buffer.valid.view(-1).float()
+        b_opp = self.buffer.opp_hands.view(-1, 52).float()
 
         valid_adv = b_advantages[b_valid > 0]
         b_advantages = (b_advantages - valid_adv.mean()) / (valid_adv.std() + 1e-8)
@@ -285,6 +295,8 @@ class PPOTrainer:
         total_a_loss = 0
         total_c_loss = 0
         total_d_loss = 0
+        total_aux_loss = 0
+        aux_hits = aux_total = aux_baseline = 0.0
         batches = 0
         distill_batch = min(self.cfg.batch_size, len(distill["states"])) if distill is not None else 0
 
@@ -301,7 +313,7 @@ class PPOTrainer:
                 mb_valid = b_valid[idx]
                 n_valid = mb_valid.sum().clamp(min=1.0)
 
-                logits, new_values = self.model(mb_states, mb_masks)
+                logits, new_values, aux_logits = self.model.forward_with_aux(mb_states, mb_masks)
                 dist = torch.distributions.Categorical(logits=logits)
 
                 new_logprobs = dist.log_prob(mb_actions)
@@ -317,6 +329,23 @@ class PPOTrainer:
                 critic_loss = F.mse_loss(new_values.squeeze(-1), mb_returns)
 
                 loss = actor_loss + (self.cfg.vf_coef * critic_loss) - (self.cfg.ent_coef * entropy)
+
+                if self.cfg.aux_coef > 0:
+                    mb_opp = b_opp[idx]
+                    aux_loss = F.binary_cross_entropy_with_logits(aux_logits, mb_opp)
+                    loss = loss + self.cfg.aux_coef * aux_loss
+                    total_aux_loss += aux_loss.item()
+                    with torch.no_grad():
+                        # Precision of the top-k predicted cards, k = opponent hand size, against a
+                        # random guess among the cards that could be in their hand.
+                        k = mb_opp.sum(dim=1)
+                        top = torch.topk(aux_logits, 26, dim=1).indices
+                        rank_ok = (torch.arange(26, device=self.device)[None, :] < k[:, None]).float()
+                        hits = (mb_opp.gather(1, top) * rank_ok).sum(dim=1)
+                        candidates = mb_states[:, KNOWN_CARDS].sum(dim=1) + mb_states[:, UNSEEN_CARDS].sum(dim=1)
+                        aux_hits += hits.sum().item()
+                        aux_total += k.sum().item()
+                        aux_baseline += (k * k / candidates.clamp(min=1)).sum().item()
 
                 if distill is not None:
                     d_idx = torch.randint(len(distill["states"]), (distill_batch,), device=self.device)
@@ -336,7 +365,12 @@ class PPOTrainer:
                 total_c_loss += critic_loss.item()
                 batches += 1
 
-        return total_a_loss / batches, total_c_loss / batches, total_d_loss / batches
+        aux = {
+            "loss": total_aux_loss / batches,
+            "precision": aux_hits / max(aux_total, 1.0),
+            "baseline": aux_baseline / max(aux_total, 1.0),
+        }
+        return total_a_loss / batches, total_c_loss / batches, total_d_loss / batches, aux
 
     def evaluate(self, global_step):
         self.model.eval()

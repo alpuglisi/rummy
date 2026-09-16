@@ -79,5 +79,9 @@ class VectorizedRummyEnv:
     def current_players(self):
         return torch.from_numpy(self._env.current_players())
 
+    def opponent_hands(self):
+        """Ground-truth cards of the player not to move, [N,52] bool. Training target only."""
+        return torch.from_numpy(self._env.opponent_hands())
+
     def close(self):
         pass

@@ -393,6 +393,17 @@ void RummyEnv::randomize_hidden(uint32_t seed) {
     update_observation_buffer();
 }
 
+void RummyEnv::opponent_hand(bool* out) const {
+    const int opponent = (state.current_player == 1) ? 2 : 1;
+    for (int c = 0; c < DECK_SIZE; c++) out[c] = state.card_locations[c] == opponent;
+}
+
+py::array_t<bool> RummyEnv::get_opponent_hand() const {
+    py::array_t<bool> out(DECK_SIZE);
+    opponent_hand(out.mutable_data());
+    return out;
+}
+
 float RummyEnv::get_score(int player) const {
     return (player == 1) ? state.p1_score : state.p2_score;
 }
@@ -485,6 +496,13 @@ py::array_t<int32_t> VectorizedRummyEnv::current_players() const {
     py::array_t<int32_t> out(size());
     int32_t* o = out.mutable_data();
     for (int i = 0; i < size(); i++) o[i] = envs[i].get_current_player();
+    return out;
+}
+
+py::array_t<bool> VectorizedRummyEnv::opponent_hands() const {
+    py::array_t<bool> out({size(), DECK_SIZE});
+    bool* o = out.mutable_data();
+    for (int i = 0; i < size(); i++) envs[i].opponent_hand(o + static_cast<size_t>(i) * DECK_SIZE);
     return out;
 }
 
@@ -624,6 +642,7 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_legal_actions", &RummyEnv::get_legal_actions)
         .def("get_state", &RummyEnv::get_state)
         .def("get_current_player", &RummyEnv::get_current_player)
+        .def("get_opponent_hand", &RummyEnv::get_opponent_hand)
         .def("randomize_hidden", &RummyEnv::randomize_hidden, py::arg("seed"))
         .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
@@ -632,6 +651,8 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
         .def("get", &VectorizedRummyEnv::get, "Copy of live game i.")
         .def("current_players", &VectorizedRummyEnv::current_players, "Player to move in each game (1 or 2).")
+        .def("opponent_hands", &VectorizedRummyEnv::opponent_hands,
+             "[N,52] bool: cards held by the player not to move (training target, not observable).")
         .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,obs], masks[N,105] bool).")
         .def("step", &VectorizedRummyEnv::step,
              "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");
