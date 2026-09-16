@@ -34,6 +34,7 @@ class SearchPolicy:
         self.agreements = 0          # search picked the model's own top choice
         self.value_gap = 0.0         # mean outcome of search's pick minus the model's pick
         self.rollouts = 0
+        self.rollout_steps = 0       # engine steps played across all rollouts (they run to game end)
 
     def stats(self):
         n = max(self.decisions, 1)
@@ -41,6 +42,7 @@ class SearchPolicy:
             "agreement": self.agreements / n,
             "value_gap": self.value_gap / n,
             "rollouts_per_decision": self.rollouts / n,
+            "mean_rollout_steps": self.rollout_steps / max(self.rollouts, 1),
         }
 
     @torch.no_grad()
@@ -90,10 +92,13 @@ class SearchPolicy:
         finished = dones.copy()
         outcome[finished] = rewards[finished]   # the searcher acted, so the reward is already ours
 
+        self.rollouts += n
+        self.rollout_steps += n
         alive = ~finished
         while alive.any():
             states, masks, players = batch.observe()
             idx = np.flatnonzero(alive)
+            self.rollout_steps += len(idx)
             actions = np.zeros(n, dtype=np.int64)
             actions[idx] = self._sample(states[idx], masks[idx])
             actor[idx] = players[idx]
@@ -122,5 +127,4 @@ class SearchPolicy:
             self.decisions += 1
             self.agreements += int(best == model_pick)
             self.value_gap += s[best][0] - s[model_pick][0]
-            self.rollouts += sum(n for _, n in s.values())
         return np.array(choices, dtype=np.int64)

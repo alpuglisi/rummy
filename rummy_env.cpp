@@ -623,6 +623,7 @@ PYBIND11_MODULE(rummy_engine, m) {
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
         .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)
         .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
+        .def("get", &VectorizedRummyEnv::get, "Copy of live game i.")
         .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,obs], masks[N,105] bool).")
         .def("step", &VectorizedRummyEnv::step,
              "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");

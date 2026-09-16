@@ -69,5 +69,9 @@ class VectorizedRummyEnv:
         return (torch.from_numpy(self._apply_blank(states)), torch.from_numpy(masks),
                 torch.from_numpy(rewards), torch.from_numpy(dones))
 
+    def clone(self, i):
+        """Independent copy of live game i, for search."""
+        return self._env.get(int(i))
+
     def close(self):
         pass

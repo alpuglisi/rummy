@@ -153,6 +153,7 @@ public:
     VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads);
 
     int size() const { return static_cast<int>(envs.size()); }
+    RummyEnv get(int i) const { return envs.at(i); }
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
 };

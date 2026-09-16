@@ -1,6 +1,7 @@
 import copy
 import os
 import time
+import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
+from env.vectorized_env import blank_known
 from evaluate import DeckOnlyPolicy, GreedyPolicy, ModelPolicy, RandomPolicy, play_matches
 from search import SearchPolicy
 
@@ -65,14 +67,18 @@ class PPOTrainer:
         
         self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
                                        blank_known_prob=config.blank_known_prob)
-        self.model = RummyActorCritic(config.obs_dim, config.action_dim,
-                                      config.hidden_size, config.num_layers).to(self.device)
+        self.model = RummyActorCritic(config.obs_dim, config.action_dim, config.hidden_size,
+                                      config.num_layers, config.residual).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
-        
+
         self.writer = SummaryWriter(log_dir="runs/rummy_ppo")
         self.frozen_model = None
         self.evals_run = 0
+        self.rng = np.random.default_rng()
+        self.teacher = SearchPolicy(self.model, self.device, worlds=config.distill_worlds,
+                                    max_actions=config.distill_actions,
+                                    seed=int(self.rng.integers(0, 2**31)))
         
     def train(self):
         state, mask = self.envs.reset()
@@ -107,11 +113,21 @@ class PPOTrainer:
                 next_value, state, done, self.cfg.gamma, self.cfg.gae_lambda
             )
 
-            actor_loss, critic_loss = self.optimize(advantages, returns)
+            distill = None
+            if self.cfg.distill_coef > 0 and update % self.cfg.distill_every == 0:
+                distill = self.collect_search_targets()
+                self.writer.add_scalar("Search/TeacherAgreement", distill["agreement"], global_step)
+                self.writer.add_scalar("Search/RolloutSteps", distill["rollout_steps"], global_step)
+                self.writer.add_scalar("Perf/DistillSec", distill["seconds"], global_step)
+            t_distill = time.time()
+
+            actor_loss, critic_loss, distill_loss = self.optimize(advantages, returns, distill)
             t_optimize = time.time()
 
             self.writer.add_scalar("Loss/Actor", actor_loss, global_step)
             self.writer.add_scalar("Loss/Critic", critic_loss, global_step)
+            if distill is not None:
+                self.writer.add_scalar("Loss/Distill", distill_loss, global_step)
             self.writer.add_scalar("Reward/Average_Return", returns.mean().item(), global_step)
 
             self.buffer.clear()
@@ -125,7 +141,7 @@ class PPOTrainer:
             t_end = time.time()
 
             self.writer.add_scalar("Perf/RolloutSec", t_rollout - t_start, global_step)
-            self.writer.add_scalar("Perf/OptimizeSec", t_optimize - t_rollout, global_step)
+            self.writer.add_scalar("Perf/OptimizeSec", t_optimize - t_distill, global_step)
             self.writer.add_scalar("Perf/EvalSec", t_end - t_optimize, global_step)
             self.writer.add_scalar("Perf/TrainStepsPerSec", train_sps, global_step)
             self.writer.add_scalar("Perf/StepsPerSec", samples / (t_end - t_start), global_step)
@@ -144,7 +160,49 @@ class PPOTrainer:
             
                 print(f"Checkpoint saved at step {global_step}!")
 
-    def optimize(self, advantages, returns):
+    def collect_search_targets(self):
+        """Run the search on a sample of live training positions and turn the
+        per-action outcomes into a target distribution for the policy."""
+        cfg = self.cfg
+        t0 = time.time()
+        idx = self.rng.choice(cfg.num_envs, size=min(cfg.distill_positions, cfg.num_envs), replace=False)
+        envs = [self.envs.clone(i) for i in idx]
+
+        self.model.eval()
+        self.teacher.reset_stats()
+        stats = self.teacher.evaluate_actions(envs)
+
+        # The policy learns from its own view of each position: hide the
+        # opponent-known channel where that training game has it hidden.
+        obs = np.stack([e.get_state() for e in envs])
+        masks = np.stack([e.get_legal_actions() for e in envs]).astype(bool)
+        blank = self.envs.blank[idx]
+        if blank.any():
+            obs[blank] = blank_known(obs[blank])
+
+        targets = np.zeros((len(envs), cfg.action_dim), dtype=np.float32)
+        for j, s in enumerate(stats):
+            acts = np.fromiter(s.keys(), dtype=np.int64)
+            vals = np.array([s[a][0] for a in acts])
+            w = np.exp((vals - vals.max()) / cfg.distill_temperature)
+            targets[j, acts] = w / w.sum()
+
+        obs_t = torch.as_tensor(obs, device=self.device)
+        mask_t = torch.as_tensor(masks, device=self.device)
+        with torch.no_grad():
+            model_pick = self.model(obs_t, mask_t)[0].argmax(dim=-1).cpu().numpy()
+        self.model.train()
+
+        return {
+            "states": obs_t,
+            "masks": mask_t,
+            "targets": torch.as_tensor(targets, device=self.device),
+            "agreement": float((model_pick == targets.argmax(axis=1)).mean()),
+            "rollout_steps": self.teacher.stats()["mean_rollout_steps"],
+            "seconds": time.time() - t0,
+        }
+
+    def optimize(self, advantages, returns, distill=None):
         b_states = self.buffer.states.view(-1, self.cfg.obs_dim)
         b_masks = self.buffer.masks.view(-1, self.cfg.action_dim)
         b_actions = self.buffer.actions.view(-1)
@@ -157,7 +215,9 @@ class PPOTrainer:
         num_samples = b_states.shape[0]
         total_a_loss = 0
         total_c_loss = 0
+        total_d_loss = 0
         batches = 0
+        distill_batch = min(self.cfg.batch_size, len(distill["states"])) if distill is not None else 0
 
         for _ in range(self.cfg.epochs):
             perm = torch.randperm(num_samples, device=self.device)
@@ -187,6 +247,15 @@ class PPOTrainer:
 
                 loss = actor_loss + (self.cfg.vf_coef * critic_loss) - (self.cfg.ent_coef * entropy)
 
+                if distill is not None:
+                    d_idx = torch.randint(len(distill["states"]), (distill_batch,), device=self.device)
+                    d_logits, _ = self.model(distill["states"][d_idx], distill["masks"][d_idx])
+                    # Illegal actions carry -inf log-probs and zero target mass; clamp keeps 0 * -inf out.
+                    d_logp = F.log_softmax(d_logits, dim=-1).clamp(min=-1e4)
+                    distill_loss = -(distill["targets"][d_idx] * d_logp).sum(dim=-1).mean()
+                    loss = loss + self.cfg.distill_coef * distill_loss
+                    total_d_loss += distill_loss.item()
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
@@ -195,8 +264,8 @@ class PPOTrainer:
                 total_a_loss += actor_loss.item()
                 total_c_loss += critic_loss.item()
                 batches += 1
-                
-        return total_a_loss / batches, total_c_loss / batches
+
+        return total_a_loss / batches, total_c_loss / batches, total_d_loss / batches
 
     def evaluate(self, global_step):
         self.model.eval()
