@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +28,8 @@ class RummyActorCritic(nn.Module):
         logits = self.actor_logits(a)
         
         if action_mask is not None:
-            huge_negative = torch.tensor(-1e9, dtype=logits.dtype, device=logits.device)
+            # Masking FP16 underflow fix
+            huge_negative = torch.tensor(torch.finfo(logits.dtype).min, device=logits.device)
             logits = torch.where(action_mask, logits, huge_negative)
             
         return logits, value

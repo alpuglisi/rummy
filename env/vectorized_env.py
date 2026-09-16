@@ -12,7 +12,7 @@ def env_worker(remote, parent_remote, seed):
         if cmd == 'step':
             reward, done = env.step(data)
             if done:
-                env.reset()
+                env.reset() 
             remote.send((env.get_state(), env.get_legal_actions(), reward, done))
         elif cmd == 'reset':
             env.reset()

@@ -18,8 +18,8 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.01     # Entropy coefficient to encourage exploration
-    vf_coef: float = 0.5       # Value function coefficient
+    ent_coef: float = 0.01     
+    vf_coef: float = 0.5       
     
     # System
-    device: str = "cuda"       # Set to "cpu" for local debugging
+    device: str = "cuda"

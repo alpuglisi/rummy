@@ -12,7 +12,6 @@ int RummyEnv::get_point_value(int card) const {
 std::vector<Meld> RummyEnv::find_all_possible_melds(const std::vector<int>& hand) const {
     std::vector<Meld> valid_melds;
 
-    // 1. Sets (3 or 4 of a kind)
     for (int rank = 0; rank < 13; rank++) {
         Meld current_set;
         for (int card : hand) {
@@ -21,7 +20,6 @@ std::vector<Meld> RummyEnv::find_all_possible_melds(const std::vector<int>& hand
         if (current_set.size() >= 3) valid_melds.push_back(current_set);
     }
 
-    // 2. Runs (3+ consecutive in suit)
     for (int suit = 0; suit < 4; suit++) {
         std::vector<int> suit_cards;
         for (int card : hand) {
@@ -71,7 +69,6 @@ void RummyEnv::auto_meld(int player) {
         std::vector<Meld> possible_melds = find_all_possible_melds(hand);
 
         if (!possible_melds.empty()) {
-            // Greedily pick the highest scoring meld
             Meld best_meld = possible_melds[0];
             int best_score = 0;
 
@@ -84,13 +81,12 @@ void RummyEnv::auto_meld(int player) {
                 }
             }
 
-            // Resolve the best meld
             for (int c : best_meld) {
-                state.card_locations[c] = 4; // Move to board
+                state.card_locations[c] = 4; 
                 if (player == 1) state.p1_score += get_point_value(c);
                 else state.p2_score += get_point_value(c);
             }
-            found_meld = true; // Check again to see if remaining cards form new melds
+            found_meld = true; 
         }
     }
 }
@@ -101,6 +97,7 @@ RummyEnv::RummyEnv(uint32_t seed) : rng(seed), deck_index(0) {
     deck_order.resize(DECK_SIZE);
     for (int i = 0; i < DECK_SIZE; i++) deck_order[i] = i;
     observation_buffer.resize(OBS_SPACE_SIZE, 0.0f);
+    reset(); // Initialization fix
 }
 
 void RummyEnv::deal_initial_hands() {
@@ -138,20 +135,17 @@ void RummyEnv::update_observation_buffer() {
     std::fill(observation_buffer.begin(), observation_buffer.end(), 0.0f);
 
     for (int i = 0; i < DECK_SIZE; i++) {
-        // Channel 1: Hand
         if (state.card_locations[i] == state.current_player) {
             observation_buffer[i] = 1.0f;
         }
     }
 
-    // Channel 2 & 3: Discard Presence and Depth/Order
     for (size_t i = 0; i < state.discard_pile.size(); i++) {
         int card = state.discard_pile[i];
         observation_buffer[DECK_SIZE + card] = 1.0f;
         observation_buffer[DECK_SIZE * 2 + card] = static_cast<float>(i + 1) / state.discard_pile.size();
     }
 
-    // Meta variables
     observation_buffer[OBS_SPACE_SIZE - 3] = state.turn_phase_is_discard ? 1.0f : 0.0f;
     observation_buffer[OBS_SPACE_SIZE - 2] = static_cast<float>(deck_index) / DECK_SIZE;
     observation_buffer[OBS_SPACE_SIZE - 1] = (state.required_meld_card != -1) ? 1.0f : 0.0f;
@@ -162,13 +156,11 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
     if (state.is_terminal) return mask;
 
     if (!state.turn_phase_is_discard) {
-        // Draw Actions
-        if (deck_index < DECK_SIZE) mask[0] = 1; // Can draw deck
+        if (deck_index < DECK_SIZE) mask[0] = 1; 
         for (size_t i = 0; i < state.discard_pile.size(); i++) {
-            mask[1 + i] = 1; // Can draw at any valid depth
+            mask[1 + i] = 1; 
         }
     } else {
-        // Discard Actions
         std::vector<int> consumed_cards;
         if (state.required_meld_card != -1) {
             state.cached_required_meld = find_largest_meld_with_card(get_hand(state.current_player), state.required_meld_card);
@@ -185,9 +177,6 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
             }
         }
 
-        // If the required meld consumes the entire hand leaving no discard, unmask the hand.
-        // Per design: a player must always discard a final card, even if that means
-        // discarding a meld card and breaking the meld (resolve_meld() then applies -50).
         if (!has_legal_discard) {
             for (int i = 0; i < DECK_SIZE; i++) {
                 if (state.card_locations[i] == state.current_player) mask[53 + i] = 1;
@@ -206,9 +195,6 @@ bool RummyEnv::is_legal_action(int action) {
 bool RummyEnv::resolve_meld(int player, int discard_card) {
     if (state.cached_required_meld.empty()) return false;
 
-    // Discarding a card that's part of the required meld breaks the meld:
-    // the obligation isn't satisfied, so this is a failure (-50 penalty
-    // at the call site), not a success.
     if (std::find(state.cached_required_meld.begin(), state.cached_required_meld.end(), discard_card)
         != state.cached_required_meld.end()) {
         return false;
@@ -216,13 +202,13 @@ bool RummyEnv::resolve_meld(int player, int discard_card) {
 
     int points = 0;
     for (int c : state.cached_required_meld) {
-        state.card_locations[c] = 4; // move to board
+        state.card_locations[c] = 4; 
         points += get_point_value(c);
     }
     if (player == 1) state.p1_score += points;
     else state.p2_score += points;
 
-    state.cached_required_meld.clear(); // Clear cache
+    state.cached_required_meld.clear(); 
     return true;
 }
 
@@ -279,9 +265,6 @@ py::tuple RummyEnv::step(int action) {
         // --- DISCARD PHASE ---
         int discard_card = action - 53;
 
-        // 1. Enforce required deep-draw meld. Pass the card actually being
-        //    discarded -- resolve_meld() fails if it's a member of the
-        //    required meld (discarding it breaks the meld obligation).
         if (state.required_meld_card != -1) {
             bool melded = resolve_meld(acting_player, discard_card);
             if (!melded) {
@@ -291,22 +274,18 @@ py::tuple RummyEnv::step(int action) {
             }
         }
 
-        // 2. Execute discard
         state.card_locations[discard_card] = 3;
         state.discard_pile.push_back(discard_card);
         state.required_meld_card = -1;
 
-        // 3. Auto-meld remaining valid sets/runs to score points naturally
         auto_meld(acting_player);
 
-        // Win condition: acting player emptied their hand via melding/discarding.
         if (get_hand(acting_player).empty()) {
             float reward = settle_terminal(acting_player);
             update_observation_buffer();
             return py::make_tuple(reward, true);
         }
 
-        // Check if the deck is empty after the turn finishes
         if (deck_index >= DECK_SIZE) {
             float reward = settle_terminal(-1);
             update_observation_buffer();

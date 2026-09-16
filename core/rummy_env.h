@@ -60,10 +60,7 @@ private:
     std::vector<uint8_t> compute_legal_mask();
     bool is_legal_action(int action);
 
-    // Resolves the deep-draw meld obligation. Fails (returns false) if
-    // discard_card is itself a member of the required meld -- discarding
-    // a meld card breaks the meld, per game rules, and the caller is
-    // expected to apply the -50 penalty in that case.
+    // Resolves the deep-draw meld obligation.
     bool resolve_meld(int player, int discard_card);
     float settle_terminal(int winner);
 

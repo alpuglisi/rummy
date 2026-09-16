@@ -2,7 +2,7 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from env.vectorized import VectorizedRummyEnv
+from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
 
@@ -10,7 +10,7 @@ class RolloutBuffer:
     def __init__(self, cfg: PPOConfig, device: torch.device):
         self.states = torch.zeros((cfg.num_steps, cfg.num_envs, cfg.obs_dim), dtype=torch.float32).to(device)
         self.masks = torch.zeros((cfg.num_steps, cfg.num_envs, cfg.action_dim), dtype=torch.bool).to(device)
-        self.actions = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
+        self.actions = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.long).to(device)
         self.logprobs = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
         self.rewards = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
         self.values = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.float32).to(device)
@@ -28,18 +28,26 @@ class RolloutBuffer:
         self.dones[self.step] = done.to(self.device)
         self.step += 1
 
-    def compute_advantages(self, next_value, next_done, gamma=0.99, gae_lambda=0.95):
+    def compute_advantages(self, next_value, next_state, next_done, gamma=0.99, gae_lambda=0.95):
         advantages = torch.zeros_like(self.rewards).to(self.device)
         lastgaelam = 0
         for t in reversed(range(self.step)):
             if t == self.step - 1:
                 nextnonterminal = 1.0 - next_done.float()
                 nextvalues = next_value
+                # Check phase change for Zero-Sum discount
+                next_is_same_player = (next_state[..., -3] == 1.0).float()
             else:
                 nextnonterminal = 1.0 - self.dones[t + 1].float()
                 nextvalues = self.values[t + 1]
-            delta = self.rewards[t] + gamma * nextvalues * nextnonterminal - self.values[t]
-            advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+                next_is_same_player = (self.states[t + 1][..., -3] == 1.0).float()
+                
+            # Outputs 1.0 if same player, -1.0 if opponent
+            perspective_coef = 2.0 * next_is_same_player - 1.0
+            
+            delta = self.rewards[t] + gamma * nextvalues * perspective_coef * nextnonterminal - self.values[t]
+            advantages[t] = lastgaelam = delta + gamma * gae_lambda * perspective_coef * nextnonterminal * lastgaelam
+            
         returns = advantages + self.values
         return advantages, returns
 
@@ -83,8 +91,9 @@ class PPOTrainer:
                 _, next_value = self.model(state, mask)
                 next_value = next_value.squeeze(-1)
             
+            # Pass the current `state` as `next_state` to evaluate perspective shifts
             advantages, returns = self.buffer.compute_advantages(
-                next_value, done, self.cfg.gamma, self.cfg.gae_lambda
+                next_value, state, done, self.cfg.gamma, self.cfg.gae_lambda
             )
             
             # 3. Optimize PPO Network
