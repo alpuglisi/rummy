@@ -18,12 +18,17 @@ namespace py = pybind11;
 const int DECK_SIZE = 52;
 const int HAND_SIZE = 10;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
-const int OBS_SPACE_SIZE = DECK_SIZE * 3 + 3; // Hand, Discard Presence, Discard Order, Meta
+// Channels: hand, discard presence, discard order, melded board, opponent's
+// publicly known cards; scalars: own hand size, opponent hand size, score
+// difference, then the original three meta flags (turn phase, deck fraction,
+// required meld) which stay at the end since the trainer reads obs[-3].
+const int OBS_SPACE_SIZE = DECK_SIZE * 5 + 6;
 
 typedef std::vector<int> Meld;
 
 struct GameState {
     std::array<int8_t, DECK_SIZE> card_locations;
+    std::array<uint8_t, DECK_SIZE> publicly_known; // Taken from the pile in view of both players
     // 0 = Deck, 1 = P1 Hand, 2 = P2 Hand, 3 = Discard Pile, 4 = Melded/Board
 
     std::vector<int> discard_pile; // Index 0 is oldest, back() is top card

@@ -58,7 +58,8 @@ if torch.cuda.is_available():
     print(f"    gpu: {torch.cuda.get_device_name(0)}")
 env = rummy_engine.RummyEnv(0)
 state, mask = env.get_state(), env.get_legal_actions()
-assert state.shape == (159,) and mask.shape == (105,)
+from config import PPOConfig
+assert state.shape == (PPOConfig.obs_dim,) and mask.shape == (PPOConfig.action_dim,), state.shape
 for _ in range(20):
     legal = numpy.flatnonzero(env.get_legal_actions())
     _, done = env.step(int(legal[0]))

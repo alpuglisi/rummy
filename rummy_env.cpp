@@ -125,6 +125,7 @@ void RummyEnv::reset() {
     state.p1_score = 0.0f;
     state.p2_score = 0.0f;
     state.cached_required_meld.clear();
+    state.publicly_known.fill(0);
 
     deal_initial_hands();
 
@@ -151,6 +152,24 @@ void RummyEnv::update_observation_buffer() {
         observation_buffer[DECK_SIZE + card] = 1.0f;
         observation_buffer[DECK_SIZE * 2 + card] = static_cast<float>(i + 1) / state.discard_pile.size();
     }
+
+    // Channel 4 & 5: melded cards (dead for everyone), opponent's known hand cards
+    const int opponent = (state.current_player == 1) ? 2 : 1;
+    int own_hand_size = 0, opp_hand_size = 0;
+    for (int i = 0; i < DECK_SIZE; i++) {
+        if (state.card_locations[i] == 4) observation_buffer[DECK_SIZE * 3 + i] = 1.0f;
+        if (state.card_locations[i] == opponent) {
+            opp_hand_size++;
+            if (state.publicly_known[i]) observation_buffer[DECK_SIZE * 4 + i] = 1.0f;
+        }
+        if (state.card_locations[i] == state.current_player) own_hand_size++;
+    }
+
+    const float own_score = (state.current_player == 1) ? state.p1_score : state.p2_score;
+    const float opp_score = (state.current_player == 1) ? state.p2_score : state.p1_score;
+    observation_buffer[OBS_SPACE_SIZE - 6] = static_cast<float>(own_hand_size) / 26.0f;
+    observation_buffer[OBS_SPACE_SIZE - 5] = static_cast<float>(opp_hand_size) / 26.0f;
+    observation_buffer[OBS_SPACE_SIZE - 4] = (own_score - opp_score) / 100.0f;
 
     // Meta variables
     observation_buffer[OBS_SPACE_SIZE - 3] = state.turn_phase_is_discard ? 1.0f : 0.0f;
@@ -282,6 +301,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
 
             for (size_t i = pile_index; i < state.discard_pile.size(); i++) {
                 state.card_locations[state.discard_pile[i]] = acting_player;
+                state.publicly_known[state.discard_pile[i]] = 1;
             }
             state.discard_pile.erase(state.discard_pile.begin() + pile_index, state.discard_pile.end());
         }
@@ -313,6 +333,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
 
         // 2. Execute discard
         state.card_locations[discard_card] = 3;
+        state.publicly_known[discard_card] = 0;
         state.discard_pile.push_back(discard_card);
         state.required_meld_card = -1;
 

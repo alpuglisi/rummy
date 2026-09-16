@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 class RummyActorCritic(nn.Module):
-    def __init__(self, obs_dim=159, action_dim=105):
+    def __init__(self, obs_dim=266, action_dim=105):
         super(RummyActorCritic, self).__init__()
         
         self.shared_fc1 = nn.Linear(obs_dim, 256)
