@@ -33,7 +33,7 @@ PY="${PYTHON:-python3}"
 echo "==> Using $($PY --version) at $(command -v "$PY")"
 
 echo "==> Installing Python packages"
-$PY -m pip install -q setuptools wheel numpy pybind11 tensorboard
+$PY -m pip install -q setuptools wheel numpy pybind11 tensorboard pygame
 
 if $PY -c "import torch" 2>/dev/null; then
     echo "    torch already installed: $($PY -c 'import torch; print(torch.__version__)')"
