@@ -32,7 +32,6 @@ def main():
     config = PPOConfig()
 
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
-    config.total_timesteps = 50_000_000
 
     print(f"Initializing Rummy RL Training on {config.device.upper()}...")
 

@@ -63,7 +63,8 @@ class PPOTrainer:
         
         self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
                                        blank_known_prob=config.blank_known_prob)
-        self.model = RummyActorCritic(obs_dim=config.obs_dim, action_dim=config.action_dim).to(self.device)
+        self.model = RummyActorCritic(config.obs_dim, config.action_dim,
+                                      config.hidden_size, config.num_layers).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
         

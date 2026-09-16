@@ -6,7 +6,6 @@ import numpy as np
 import torch
 
 import rummy_engine
-from config import PPOConfig
 from env.vectorized_env import KNOWN_CARDS
 from models.ppo_network import RummyActorCritic
 
@@ -151,9 +150,7 @@ def play_matches(agent, opponent, num_games, seed=0):
 
 
 def load_model(path, device):
-    cfg = PPOConfig()
-    model = RummyActorCritic(obs_dim=cfg.obs_dim, action_dim=cfg.action_dim).to(device)
-    model.load_state_dict(torch.load(path, map_location=device))
+    model = RummyActorCritic.from_state_dict(torch.load(path, map_location=device)).to(device)
     model.eval()
     return model
 
