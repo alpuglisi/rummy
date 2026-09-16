@@ -2,6 +2,9 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
@@ -64,6 +67,9 @@ class PPOTrainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
         
+        # Initialize TensorBoard Writer
+        self.writer = SummaryWriter(log_dir="runs/rummy_run_01")
+        
     def train(self):
         state, mask = self.envs.reset()
         state = state.to(self.device)
@@ -71,6 +77,8 @@ class PPOTrainer:
         done = torch.zeros(self.cfg.num_envs, dtype=torch.bool).to(self.device)
         
         global_step = 0
+        episode_rewards = []
+        
         while global_step < self.cfg.total_timesteps:
             # 1. Collect Rollouts
             for _ in range(self.cfg.num_steps):
@@ -80,6 +88,11 @@ class PPOTrainer:
                 next_state, next_mask, reward, next_done = self.envs.step(action)
                 
                 self.buffer.store(state, mask, action, logprob, reward, value, done)
+                
+                # Track rewards for completed games
+                if next_done.any():
+                    finished_rewards = reward[next_done]
+                    episode_rewards.extend(finished_rewards.tolist())
                 
                 state = next_state.to(self.device)
                 mask = next_mask.to(self.device)
@@ -97,8 +110,18 @@ class PPOTrainer:
             )
             
             # 3. Optimize PPO Network
-            self.optimize(advantages, returns)
+            actor_loss, critic_loss, entropy = self.optimize(advantages, returns)
             self.buffer.clear()
+            
+            # 4. Log to TensorBoard
+            self.writer.add_scalar("Loss/Actor", actor_loss, global_step)
+            self.writer.add_scalar("Loss/Critic", critic_loss, global_step)
+            self.writer.add_scalar("Loss/Entropy", entropy, global_step)
+            
+            if episode_rewards:
+                mean_reward = np.mean(episode_rewards)
+                self.writer.add_scalar("Rollout/Mean_Reward", mean_reward, global_step)
+                episode_rewards = [] # Reset for the next batch
             
             print(f"Global Step: {global_step} / {self.cfg.total_timesteps}")
 
@@ -114,6 +137,10 @@ class PPOTrainer:
 
         dataset = TensorDataset(b_states, b_masks, b_actions, b_logprobs, b_advantages, b_returns)
         loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=True)
+
+        # Track losses for TensorBoard
+        total_a_loss, total_c_loss, total_ent = 0.0, 0.0, 0.0
+        batches = 0
 
         for _ in range(self.cfg.epochs):
             for batch in loader:
@@ -141,6 +168,13 @@ class PPOTrainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
+                
+                total_a_loss += actor_loss.item()
+                total_c_loss += critic_loss.item()
+                total_ent += entropy.item()
+                batches += 1
+                
+        return (total_a_loss / batches), (total_c_loss / batches), (total_ent / batches)
 
     def save_checkpoint(self, path: str):
         torch.save(self.model.state_dict(), path)
