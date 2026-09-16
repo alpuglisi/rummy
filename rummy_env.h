@@ -59,6 +59,7 @@ private:
     int deck_index;
 
     std::vector<float> observation_buffer;
+    int manual_meld_player = 0;   // Seat that chooses its own melds (0 = none: everyone auto-melds)
 
     void deal_initial_hands();
     void update_observation_buffer();
@@ -98,6 +99,15 @@ public:
     // cards and the undrawn deck) at random. The current player's observation
     // is unchanged, so search over clones never uses hidden information.
     void randomize_hidden(uint32_t seed);
+
+    // Manual melding for a human seat. Auto-meld is skipped for that player;
+    // during their discard phase they may lay down valid sets/runs with
+    // meld(). A meld containing the pile-draw's required card satisfies that
+    // obligation; melding the whole hand goes out.
+    void set_manual_meld(int player) { manual_meld_player = player; }
+    int get_manual_meld() const { return manual_meld_player; }
+    bool is_valid_meld(const std::vector<int>& cards) const;
+    py::tuple meld(const std::vector<int>& cards);
 
     // As randomize_hidden, but the opponent's unknown cards are drawn from the
     // hidden pool in proportion to weights[card] (a belief that the card is in

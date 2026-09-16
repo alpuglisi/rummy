@@ -342,7 +342,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         state.required_meld_card = -1;
 
         // 3. Auto-meld remaining valid sets/runs to score points naturally
-        auto_meld(acting_player);
+        if (acting_player != manual_meld_player) auto_meld(acting_player);
 
         // Win condition: acting player emptied their hand via melding/discarding.
         if (get_hand(acting_player).empty()) {
@@ -439,6 +439,61 @@ void RummyEnv::randomize_hidden_weighted_py(uint32_t seed,
         throw std::invalid_argument("weights must have one entry per card");
     }
     randomize_hidden_weighted(seed, weights.data());
+}
+
+bool RummyEnv::is_valid_meld(const std::vector<int>& cards) const {
+    if (cards.size() < 3) return false;
+    std::vector<int> sorted(cards);
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) return false;
+    for (int c : sorted) if (c < 0 || c >= DECK_SIZE) return false;
+
+    bool same_rank = true, same_suit = true;
+    for (int c : sorted) {
+        if (get_rank(c) != get_rank(sorted[0])) same_rank = false;
+        if (get_suit(c) != get_suit(sorted[0])) same_suit = false;
+    }
+    if (same_rank) return sorted.size() <= 4;
+    if (!same_suit) return false;
+    for (size_t i = 1; i < sorted.size(); i++) {
+        if (get_rank(sorted[i]) != get_rank(sorted[i - 1]) + 1) return false;
+    }
+    return true;
+}
+
+py::tuple RummyEnv::meld(const std::vector<int>& cards) {
+    if (state.is_terminal) throw std::invalid_argument("game is over");
+    if (!state.turn_phase_is_discard) throw std::invalid_argument("melds are laid down after drawing");
+    for (int c : cards) {
+        if (c < 0 || c >= DECK_SIZE || state.card_locations[c] != state.current_player) {
+            throw std::invalid_argument("all melded cards must be in your hand");
+        }
+    }
+    if (!is_valid_meld(cards)) throw std::invalid_argument("not a valid set or run");
+    // The card taken from the pile must be melded before anything else, so a
+    // player cannot lay down other melds that break its only meld.
+    if (state.required_meld_card != -1 &&
+        std::find(cards.begin(), cards.end(), state.required_meld_card) == cards.end()) {
+        throw std::invalid_argument("you must first meld the card you took from the pile");
+    }
+
+    const int player = state.current_player;
+    for (int c : cards) {
+        state.card_locations[c] = 4;
+        if (player == 1) state.p1_score += get_point_value(c);
+        else state.p2_score += get_point_value(c);
+        if (c == state.required_meld_card) {
+            state.required_meld_card = -1;
+            state.cached_required_meld.clear();
+        }
+    }
+    if (get_hand(player).empty()) {
+        float reward = settle_terminal(player);
+        update_observation_buffer();
+        return py::make_tuple(reward, true);
+    }
+    update_observation_buffer();
+    return py::make_tuple(0.0f, false);
 }
 
 void RummyEnv::opponent_hand(bool* out) const {
@@ -710,6 +765,11 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_opponent_hand", &RummyEnv::get_opponent_hand)
         .def("randomize_hidden", &RummyEnv::randomize_hidden, py::arg("seed"))
         .def("randomize_hidden_weighted", &RummyEnv::randomize_hidden_weighted_py, py::arg("seed"), py::arg("weights"))
+        .def("set_manual_meld", &RummyEnv::set_manual_meld, py::arg("player"),
+             "Seat that lays down its own melds (0 = everyone auto-melds).")
+        .def("get_manual_meld", &RummyEnv::get_manual_meld)
+        .def("is_valid_meld", &RummyEnv::is_valid_meld, py::arg("cards"))
+        .def("meld", &RummyEnv::meld, py::arg("cards"), "Lay down a set or run from hand; returns (reward, done).")
         .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")

@@ -89,6 +89,7 @@ class SearchPolicy:
             agent = env.get_current_player()
             for _ in range(self.worlds):
                 world = env.clone()
+                world.set_manual_meld(0)   # simulated players all auto-meld, as in training
                 seed = int(self.rng.integers(0, 2**31))
                 if beliefs is not None:
                     world.randomize_hidden_weighted(seed, beliefs[i])
