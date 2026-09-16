@@ -1,0 +1,21 @@
+# Card-detection vision pipeline (download -> synthetic data -> model -> train)
+# Install into a fresh venv:  pip install -r vision/requirements.txt
+# For GPU training install the CUDA build of torch first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.3
+opencv-python-headless>=4.9
+numpy>=1.26
+pillow>=10
+pyyaml>=6
+tqdm>=4.66
+scipy>=1.11
+# dataset clients
+huggingface_hub>=0.23
+roboflow>=1.1
+kaggle>=1.6
+# export / tests
+onnx>=1.15
+onnxruntime>=1.17
+pytest>=8

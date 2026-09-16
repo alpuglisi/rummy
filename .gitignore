@@ -5,3 +5,15 @@ __pycache__/
 build/
 *.egg-info/
 *.pth
+
+# --- vision / card-detection pipeline ---
+.venv-vision/
+data/
+runs/vision/
+*.pt
+*.onnx
+*.tflite
+*.engine
+*.pkl
+vision/**/__pycache__/
+.pytest_cache/
