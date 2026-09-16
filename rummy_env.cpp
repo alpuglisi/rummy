@@ -165,8 +165,15 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
     if (!state.turn_phase_is_discard) {
         // Draw Actions
         if (deck_index < DECK_SIZE) mask[0] = 1; // Can draw deck
+        // A pile draw is only legal when the deepest card taken can be melded
+        // immediately with the hand plus everything above it in the pile.
+        std::vector<int> hand = get_hand(state.current_player);
         for (size_t i = 0; i < state.discard_pile.size(); i++) {
-            mask[1 + i] = 1; // Can draw at any valid depth
+            std::vector<int> combined(hand);
+            combined.insert(combined.end(), state.discard_pile.begin() + i, state.discard_pile.end());
+            if (!find_largest_meld_with_card(combined, state.discard_pile[i]).empty()) {
+                mask[1 + i] = 1;
+            }
         }
     } else {
         // Discard Actions
@@ -289,6 +296,13 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         //    discarded -- resolve_meld() fails if it's a member of the
         //    required meld (discarding it breaks the meld obligation).
         if (state.required_meld_card != -1) {
+            // Melding the entire hand is going out; there is no card left to discard.
+            if (state.cached_required_meld.size() == get_hand(acting_player).size()) {
+                resolve_meld(acting_player, -1);
+                float reward = settle_terminal(acting_player);
+                update_observation_buffer();
+                return {reward, true};
+            }
             bool melded = resolve_meld(acting_player, discard_card);
             if (!melded) {
                 state.is_terminal = true;

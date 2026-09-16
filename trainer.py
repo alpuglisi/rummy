@@ -84,7 +84,8 @@ class PPOTrainer:
                     action, logprob, value = self.model.get_action(state, mask)
                 
                 next_state, next_mask, reward, next_done = self.envs.step(action)
-                
+                reward = reward * self.cfg.reward_scale
+
                 self.buffer.store(state, mask, action, logprob, reward, value, done)
                 
                 state = next_state.to(self.device)

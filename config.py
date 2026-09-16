@@ -16,6 +16,7 @@ class PPOConfig:
     batch_size: int = 256
     
     # PPO Math
+    reward_scale: float = 0.02  # Engine rewards are +-100 at game end; keep value targets O(1)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
