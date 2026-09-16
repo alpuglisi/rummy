@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
-from evaluate import DeckOnlyPolicy, ModelPolicy, RandomPolicy, play_matches
+from evaluate import DeckOnlyPolicy, GreedyPolicy, ModelPolicy, RandomPolicy, play_matches
 
 class RolloutBuffer:
     def __init__(self, cfg: PPOConfig, device: torch.device):
@@ -189,16 +189,19 @@ class PPOTrainer:
 
         vs_random = play_matches(agent, RandomPolicy(global_step), n, seed=global_step)
         vs_deck = play_matches(agent, DeckOnlyPolicy(global_step), n, seed=global_step + 1)
+        vs_greedy = play_matches(agent, GreedyPolicy(global_step), n, seed=global_step + 3)
+        greedy_score = vs_greedy["win_rate"] + 0.5 * vs_greedy["draw_rate"]
         self.writer.add_scalar("Eval/WinRate_vs_Random", vs_random["win_rate"], global_step)
         self.writer.add_scalar("Eval/WinRate_vs_DeckOnly", vs_deck["win_rate"], global_step)
-        self.writer.add_scalar("Eval/DrawRate_vs_DeckOnly", vs_deck["draw_rate"], global_step)
-        self.writer.add_scalar("Eval/PenaltyRate", vs_deck["penalty_rate"], global_step)
-        self.writer.add_scalar("Eval/DeepDrawRate", vs_deck["deep_draw_rate"], global_step)
-        self.writer.add_scalar("Eval/MeldPoints", vs_deck["meld_points"], global_step)
-        self.writer.add_scalar("Eval/MeanTurns", vs_deck["mean_turns"], global_step)
-        line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | vs deck-only {vs_deck['win_rate']:.1%} "
-                f"(draws {vs_deck['draw_rate']:.1%}) | deep-draw {vs_deck['deep_draw_rate']:.1%} | "
-                f"meld pts {vs_deck['meld_points']:.1f} | {vs_deck['mean_turns']:.1f} turns")
+        self.writer.add_scalar("Eval/Score_vs_Greedy", greedy_score, global_step)
+        self.writer.add_scalar("Eval/PenaltyRate", vs_greedy["penalty_rate"], global_step)
+        self.writer.add_scalar("Eval/DeepDrawRate", vs_greedy["deep_draw_rate"], global_step)
+        self.writer.add_scalar("Eval/PileTakeRate", vs_greedy["pile_take_rate"], global_step)
+        self.writer.add_scalar("Eval/MeldPoints", vs_greedy["meld_points"], global_step)
+        self.writer.add_scalar("Eval/MeanTurns", vs_greedy["mean_turns"], global_step)
+        line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | vs deck-only {vs_deck['win_rate']:.1%} | "
+                f"vs greedy {greedy_score:.1%} | pile-take {vs_greedy['pile_take_rate']:.1%} | "
+                f"meld pts {vs_greedy['meld_points']:.1f} | {vs_greedy['mean_turns']:.1f} turns")
 
         # Win rate against a snapshot of this policy from frozen_refresh evals ago;
         # above 50% means self-play is still making progress.

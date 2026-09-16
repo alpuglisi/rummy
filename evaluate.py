@@ -35,6 +35,29 @@ class DeckOnlyPolicy:
         return actions
 
 
+CARD_POINTS = np.array([15 if r == 0 else 10 if r >= 9 else 5 for r in range(52)])[np.arange(52) % 13]
+
+
+class GreedyPolicy:
+    """Deepest legal pile draw (else deck); discard the highest-value legal card."""
+
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
+
+    def act(self, obs, mask):
+        actions = np.empty(len(obs), dtype=np.int64)
+        for i in range(len(obs)):
+            legal = np.flatnonzero(mask[i])
+            if obs[i, -3] == 0.0:
+                pile = legal[legal > 0]
+                actions[i] = pile.min() if len(pile) else 0
+            else:
+                points = CARD_POINTS[legal - 53]
+                best = legal[points == points.max()]
+                actions[i] = self.rng.choice(best)
+        return actions
+
+
 class ModelPolicy:
     def __init__(self, model, device, greedy=False):
         self.model = model
@@ -69,7 +92,7 @@ def play_matches(agent, opponent, num_games, seed=0):
 
     wins = draws = 0
     agent_penalties = 0
-    agent_draws = agent_deep_draws = 0
+    agent_draws = agent_deep_draws = agent_pile_available = 0
     game_lengths = np.zeros(num_games, dtype=np.int64)
     # Agent's score sampled before its final step: meld points, excluding the
     # opponent's leftover hand value that settle_terminal() adds at game end.
@@ -91,6 +114,7 @@ def play_matches(agent, opponent, num_games, seed=0):
         draw_phase = obs[:, -3] == 0.0
         agent_draws += int((agent_turn & draw_phase).sum())
         agent_deep_draws += int((agent_turn & draw_phase & (actions > 0)).sum())
+        agent_pile_available += int((agent_turn & draw_phase & mask[:, 1:].any(axis=1)).sum())
 
         for j, i in enumerate(live):
             meld_points[i] = envs[i].get_score(int(agent_player[i]))
@@ -115,6 +139,7 @@ def play_matches(agent, opponent, num_games, seed=0):
         "draw_rate": draws / num_games,
         "penalty_rate": agent_penalties / num_games,
         "deep_draw_rate": agent_deep_draws / max(agent_draws, 1),
+        "pile_take_rate": agent_deep_draws / max(agent_pile_available, 1),
         "meld_points": float(meld_points.mean()),
         "mean_turns": float(game_lengths.mean()) / 2,
     }
@@ -140,19 +165,24 @@ def main():
     baseline = ModelPolicy(load_model(args.checkpoints[0], device), device, args.greedy)
     random_policy = RandomPolicy(args.seed)
     deck_only = DeckOnlyPolicy(args.seed)
+    greedy = GreedyPolicy(args.seed)
+
+    def score(s):
+        return s["win_rate"] + 0.5 * s["draw_rate"]
 
     print(f"baseline: {os.path.basename(args.checkpoints[0])}   "
-          f"(deep-draw %, meld pts and turns are from games vs deck-only)")
-    print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs base':>8} {'draws':>6} "
-          f"{'penalty':>8} {'deep-draw':>10} {'meld pts':>9} {'turns':>6}")
+          f"(scores count a draw as half a win; pile-take, meld pts and turns are from games vs greedy)")
+    print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs greedy':>9} {'vs base':>8} "
+          f"{'penalty':>8} {'pile-take':>10} {'meld pts':>9} {'turns':>6}")
     for path in args.checkpoints:
         agent = ModelPolicy(load_model(path, device), device, args.greedy)
         vs_random = play_matches(agent, random_policy, args.games, args.seed)
         vs_deck = play_matches(agent, deck_only, args.games, args.seed + 1)
-        vs_base = play_matches(agent, baseline, args.games, args.seed + 2)
-        print(f"{os.path.basename(path):<28} {vs_random['win_rate']:>9.1%} {vs_deck['win_rate']:>8.1%} "
-              f"{vs_base['win_rate']:>8.1%} {vs_base['draw_rate']:>6.1%} {vs_deck['penalty_rate']:>8.1%} "
-              f"{vs_deck['deep_draw_rate']:>10.1%} {vs_deck['meld_points']:>9.1f} {vs_deck['mean_turns']:>6.1f}")
+        vs_greedy = play_matches(agent, greedy, args.games, args.seed + 2)
+        vs_base = play_matches(agent, baseline, args.games, args.seed + 3)
+        print(f"{os.path.basename(path):<28} {score(vs_random):>9.1%} {score(vs_deck):>8.1%} "
+              f"{score(vs_greedy):>9.1%} {score(vs_base):>8.1%} {vs_greedy['penalty_rate']:>8.1%} "
+              f"{vs_greedy['pile_take_rate']:>10.1%} {vs_greedy['meld_points']:>9.1f} {vs_greedy['mean_turns']:>6.1f}")
 
 
 if __name__ == "__main__":
