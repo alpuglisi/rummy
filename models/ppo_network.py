@@ -28,6 +28,7 @@ class RummyActorCritic(nn.Module):
         self.obs_dim = obs_dim
         self.num_layers = num_layers
         self.residual = residual
+        self.has_aux = True   # False when loaded from a checkpoint saved without the auxiliary head
         if residual:
             self.input = nn.Linear(obs_dim, hidden_size)
             self.blocks = nn.ModuleList(ResidualBlock(hidden_size) for _ in range(num_layers))
@@ -104,4 +105,5 @@ class RummyActorCritic(nn.Module):
         unexpected_missing = [k for k in result.missing_keys if not k.startswith("aux_opponent.")]
         if unexpected_missing or result.unexpected_keys:
             raise RuntimeError(f"checkpoint mismatch: missing {unexpected_missing}, unexpected {result.unexpected_keys}")
+        model.has_aux = not any(k.startswith("aux_opponent.") for k in result.missing_keys)
         return model

@@ -115,7 +115,10 @@ def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
             else:
                 actions[agent_idx] = agent.act(states[agent_idx], masks[agent_idx])
         if len(opp_idx):
-            actions[opp_idx] = opponent.act(states[opp_idx], masks[opp_idx])
+            if getattr(opponent, "needs_env", False):
+                actions[opp_idx] = opponent.act_envs([batch.get(int(i)) for i in opp_idx])
+            else:
+                actions[opp_idx] = opponent.act(states[opp_idx], masks[opp_idx])
 
         draw_phase = states[agent_idx, -3] == 0.0
         agent_draws += int(draw_phase.sum())

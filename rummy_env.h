@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <exception>
+#include <cmath>
+#include <limits>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -97,6 +99,13 @@ public:
     // is unchanged, so search over clones never uses hidden information.
     void randomize_hidden(uint32_t seed);
 
+    // As randomize_hidden, but the opponent's unknown cards are drawn from the
+    // hidden pool in proportion to weights[card] (a belief that the card is in
+    // their hand); the rest of the pool becomes the deck in random order.
+    void randomize_hidden_weighted(uint32_t seed, const float* weights);
+    void randomize_hidden_weighted_py(uint32_t seed,
+                                      py::array_t<float, py::array::c_style | py::array::forcecast> weights);
+
     py::array_t<uint8_t> get_legal_actions();
     py::array_t<float> get_state() const;
 
@@ -184,4 +193,6 @@ public:
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
     py::array_t<float> scores() const;
     void randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds);
+    void randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
+                                   py::array_t<float, py::array::c_style | py::array::forcecast> weights);
 };

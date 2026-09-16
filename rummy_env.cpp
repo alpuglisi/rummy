@@ -393,6 +393,54 @@ void RummyEnv::randomize_hidden(uint32_t seed) {
     update_observation_buffer();
 }
 
+void RummyEnv::randomize_hidden_weighted(uint32_t seed, const float* weights) {
+    const int opponent = (state.current_player == 1) ? 2 : 1;
+    std::vector<int> pool;
+    int unknown_in_hand = 0;
+    for (int c = 0; c < DECK_SIZE; c++) {
+        if (state.card_locations[c] == opponent && !state.publicly_known[c]) {
+            pool.push_back(c);
+            unknown_in_hand++;
+        }
+    }
+    for (int i = deck_index; i < DECK_SIZE; i++) pool.push_back(deck_order[i]);
+
+    // Weighted sampling without replacement (Efraimidis-Spirakis): each card
+    // gets key u^(1/w); the k largest keys are the opponent's cards.
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<double> uni(std::numeric_limits<double>::min(), 1.0);
+    std::vector<std::pair<double, int>> keyed;
+    keyed.reserve(pool.size());
+    for (int c : pool) {
+        const double w = std::max(1e-4, std::min(1.0, static_cast<double>(weights[c])));
+        keyed.emplace_back(std::pow(uni(gen), 1.0 / w), c);
+    }
+    std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<int> rest;
+    for (size_t k = 0; k < keyed.size(); k++) {
+        const int c = keyed[k].second;
+        if (static_cast<int>(k) < unknown_in_hand) {
+            state.card_locations[c] = static_cast<int8_t>(opponent);
+        } else {
+            state.card_locations[c] = 0;
+            rest.push_back(c);
+        }
+    }
+    std::shuffle(rest.begin(), rest.end(), gen);
+    for (size_t k = 0; k < rest.size(); k++) deck_order[deck_index + k] = rest[k];
+    rng.seed(seed ^ 0x9e3779b9u);
+    update_observation_buffer();
+}
+
+void RummyEnv::randomize_hidden_weighted_py(uint32_t seed,
+                                            py::array_t<float, py::array::c_style | py::array::forcecast> weights) {
+    if (weights.ndim() != 1 || weights.shape(0) != DECK_SIZE) {
+        throw std::invalid_argument("weights must have one entry per card");
+    }
+    randomize_hidden_weighted(seed, weights.data());
+}
+
 void RummyEnv::opponent_hand(bool* out) const {
     const int opponent = (state.current_player == 1) ? 2 : 1;
     for (int c = 0; c < DECK_SIZE; c++) out[c] = state.card_locations[c] == opponent;
@@ -631,6 +679,23 @@ void EnvBatch::randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::a
     parallel_for(pool.get(), n, [&](int i) { envs[i].randomize_hidden(sd[i]); });
 }
 
+void EnvBatch::randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
+                                         py::array_t<float, py::array::c_style | py::array::forcecast> weights) {
+    const int n = size();
+    if (seeds.ndim() != 1 || seeds.shape(0) != n) {
+        throw std::invalid_argument("seeds must be a 1-D array with one entry per environment");
+    }
+    if (weights.ndim() != 2 || weights.shape(0) != n || weights.shape(1) != DECK_SIZE) {
+        throw std::invalid_argument("weights must be [N, 52]");
+    }
+    const uint32_t* sd = seeds.data();
+    const float* w = weights.data();
+    py::gil_scoped_release release;
+    parallel_for(pool.get(), n, [&](int i) {
+        envs[i].randomize_hidden_weighted(sd[i], w + static_cast<size_t>(i) * DECK_SIZE);
+    });
+}
+
 // --- Pybind11 Module Definition ---
 PYBIND11_MODULE(rummy_engine, m) {
     py::class_<RummyEnv>(m, "RummyEnv")
@@ -644,6 +709,7 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_current_player", &RummyEnv::get_current_player)
         .def("get_opponent_hand", &RummyEnv::get_opponent_hand)
         .def("randomize_hidden", &RummyEnv::randomize_hidden, py::arg("seed"))
+        .def("randomize_hidden_weighted", &RummyEnv::randomize_hidden_weighted_py, py::arg("seed"), py::arg("weights"))
         .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
@@ -665,5 +731,6 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("observe", &EnvBatch::observe, "Returns (states, masks, current_players[N] int32).")
         .def("step", &EnvBatch::step, "Returns (rewards, dones); finished games are left as they are.")
         .def("scores", &EnvBatch::scores, "Returns [N,2] scores for players 1 and 2.")
-        .def("randomize_hidden", &EnvBatch::randomize_hidden, py::arg("seeds"));
+        .def("randomize_hidden", &EnvBatch::randomize_hidden, py::arg("seeds"))
+        .def("randomize_hidden_weighted", &EnvBatch::randomize_hidden_weighted, py::arg("seeds"), py::arg("weights"));
 }

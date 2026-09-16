@@ -20,14 +20,27 @@ class SearchPolicy:
 
     needs_env = True
 
-    def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0):
+    def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0, belief=False):
         self.model = model
         self.device = device
         self.worlds = worlds
         self.max_actions = max_actions
         self.rng = np.random.default_rng(seed)
         self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 1)
+        # Belief-weighted worlds: deal the opponent's unknown cards in proportion to the
+        # auxiliary head's predicted probabilities instead of uniformly.
+        if belief and not getattr(model, "has_aux", False):
+            raise ValueError("belief-weighted search needs a checkpoint trained with the opponent-hand head")
+        self.belief = belief
         self.reset_stats()
+
+    @torch.no_grad()
+    def _beliefs(self, obs, mask):
+        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
+        _, _, aux = self.model.forward_with_aux(obs_t, mask_t)
+        return torch.sigmoid(aux).cpu().numpy().astype(np.float32)
 
     def reset_stats(self):
         self.decisions = 0
@@ -67,6 +80,8 @@ class SearchPolicy:
             order = legal[np.argsort(-probs[i, legal])]
             candidates.append(order[: self.max_actions])
 
+        beliefs = self._beliefs(obs, mask) if self.belief else None
+
         # One rollout per (env, world, candidate). Worlds are built once per env
         # and copied per candidate so every candidate faces the same redeals.
         sims, sim_env, sim_action, sim_agent = [], [], [], []
@@ -74,7 +89,11 @@ class SearchPolicy:
             agent = env.get_current_player()
             for _ in range(self.worlds):
                 world = env.clone()
-                world.randomize_hidden(int(self.rng.integers(0, 2**31)))
+                seed = int(self.rng.integers(0, 2**31))
+                if beliefs is not None:
+                    world.randomize_hidden_weighted(seed, beliefs[i])
+                else:
+                    world.randomize_hidden(seed)
                 for a in candidates[i]:
                     sims.append(world.clone())
                     sim_env.append(i)
