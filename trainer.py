@@ -24,7 +24,7 @@ class RolloutBuffer:
         self.actions[self.step] = action.to(self.device)
         self.logprobs[self.step] = logprob.to(self.device)
         self.rewards[self.step] = reward.to(self.device)
-        self.values[self.step] = value.squeeze().to(self.device)
+        self.values[self.step] = value.squeeze(-1).to(self.device)
         self.dones[self.step] = done.to(self.device)
         self.step += 1
 
@@ -81,7 +81,7 @@ class PPOTrainer:
             # 2. Compute Advantages
             with torch.no_grad():
                 _, next_value = self.model(state, mask)
-                next_value = next_value.squeeze()
+                next_value = next_value.squeeze(-1)
             
             advantages, returns = self.buffer.compute_advantages(
                 next_value, done, self.cfg.gamma, self.cfg.gae_lambda
@@ -124,7 +124,7 @@ class PPOTrainer:
                 pg_loss2 = mb_advantages * torch.clamp(ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef)
                 actor_loss = -torch.min(pg_loss1, pg_loss2).mean()
 
-                critic_loss = F.mse_loss(new_values.squeeze(), mb_returns)
+                critic_loss = F.mse_loss(new_values.squeeze(-1), mb_returns)
 
                 loss = actor_loss + (self.cfg.vf_coef * critic_loss) - (self.cfg.ent_coef * entropy)
 
