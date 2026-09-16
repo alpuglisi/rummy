@@ -44,6 +44,8 @@ def main():
     finally:
         trainer.save_checkpoint(FINAL_CHECKPOINT)
         print("Checkpoint saved. Shutting down environments.")
+        if trainer.best_model is not None:
+            print(f"Best checkpoint (from step {trainer.best_step:,}): {config.best_checkpoint}")
         trainer.writer.close()
         trainer.envs.close()
 

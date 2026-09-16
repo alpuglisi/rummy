@@ -84,6 +84,8 @@ class PPOTrainer:
 
         self.writer = SummaryWriter(log_dir="runs/rummy_ppo")
         self.frozen_model = None
+        self.best_model = None      # incumbent best policy (see config.best_checkpoint)
+        self.best_step = 0
         self.evals_run = 0
         self.rng = np.random.default_rng()
         self.last_aux = None
@@ -414,12 +416,34 @@ class PPOTrainer:
             line += f" | vs frozen {score:.1%}"
         if self.evals_run % self.cfg.frozen_refresh == 0:
             self.frozen_model = copy.deepcopy(self.model)
+        line += self.update_best(agent, global_step, n)
         if self.cfg.search_eval_every and self.evals_run % self.cfg.search_eval_every == 0:
             line += self.evaluate_search(agent, global_step)
         self.evals_run += 1
 
         self.model.train()
         print(line)
+
+    def update_best(self, agent, global_step, n):
+        """Promote the live policy to best.pth when it beats the incumbent
+        head-to-head by the configured margin. Head-to-head is a stronger
+        signal than the greedy score once the policy is well past greedy."""
+        first = self.best_model is None
+        if first:
+            promoted = True
+            note = f" | best: first checkpoint -> {self.cfg.best_checkpoint}"
+        else:
+            vs_best = play_matches(agent, ModelPolicy(self.best_model, self.device), n, seed=global_step + 6)
+            score = vs_best["win_rate"] + 0.5 * vs_best["draw_rate"]
+            self.writer.add_scalar("Eval/Score_vs_Best", score, global_step)
+            promoted = score >= 0.5 + self.cfg.best_margin
+            note = f" | vs best {score:.1%} " + ("(promoted)" if promoted else f"(best is step {self.best_step:,})")
+        if promoted:
+            self.best_model = copy.deepcopy(self.model).eval()
+            self.best_step = global_step
+            self.save_checkpoint(self.cfg.best_checkpoint)
+        self.writer.add_scalar("Eval/BestStep", self.best_step, global_step)
+        return note
 
     def evaluate_search(self, plain, global_step):
         cfg = self.cfg

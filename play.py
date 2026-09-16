@@ -1,6 +1,9 @@
 """Play Rummy against the trained model.
 
-    python play.py archive/best_pool_235M.pth [--worlds 64 --actions 6 --seed 1 --no-search]
+    python play.py [checkpoint] [--worlds 64 --actions 6 --seed 1 --no-search]
+
+Without a checkpoint argument the game uses checkpoints/best.pth, which the
+trainer updates whenever the live policy beats the previous best head-to-head.
 
 Draw phase: click the deck, or click a discard-pile card to take the pile from
 that card up. Only cards you can legally take are highlighted: the deepest card
@@ -24,6 +27,7 @@ import pygame
 import torch
 
 import rummy_engine
+from config import PPOConfig
 from evaluate import ModelPolicy, load_model
 from search import SearchPolicy
 
@@ -360,15 +364,19 @@ class View:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("checkpoint")
+    parser.add_argument("checkpoint", nargs="?", default=PPOConfig.best_checkpoint,
+                        help="model to play against (default: the trainer's best checkpoint)")
     parser.add_argument("--worlds", type=int, default=64)
     parser.add_argument("--actions", type=int, default=6)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--no-search", action="store_true", help="computer plays the plain policy")
     args = parser.parse_args()
 
+    if not os.path.exists(args.checkpoint):
+        sys.exit(f"checkpoint not found: {args.checkpoint} (train first, or pass a .pth file)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
+    print(f"Playing against {args.checkpoint}")
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))

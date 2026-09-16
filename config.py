@@ -47,6 +47,11 @@ class PPOConfig:
     # Search diagnostics (model + Monte Carlo search vs the model alone)
     search_eval_every: int = 2 # Run every N evals; costlier than the plain evals
     search_eval_games: int = 100
+    # Best-checkpoint tracking: at every eval the live policy plays eval_games
+    # head-to-head against the incumbent best; it replaces it (and is written
+    # to best_checkpoint) when it scores at least 50% + best_margin.
+    best_checkpoint: str = "checkpoints/best.pth"
+    best_margin: float = 0.02
     search_worlds: int = 16
     search_actions: int = 4
 
