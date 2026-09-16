@@ -5,8 +5,28 @@ import torch
 
 import rummy_engine
 
-# Observation slice holding the opponent's publicly known cards (see rummy_env.h).
-KNOWN_CARDS = slice(4 * 52, 5 * 52)
+# Observation layout (see rummy_env.h): six 52-card channels then six scalars.
+KNOWN_CARDS = slice(4 * 52, 5 * 52)    # opponent's publicly known hand cards
+UNSEEN_CARDS = slice(5 * 52, 6 * 52)   # deck or opponent's unknown hand
+CHANNELS_END = 6 * 52
+
+
+def blank_known(states):
+    """Hide the opponent-known channel in place, folding those cards into
+    'unseen' so the view matches a player who did not track the opponent's picks."""
+    states[:, UNSEEN_CARDS] = np.maximum(states[:, UNSEEN_CARDS], states[:, KNOWN_CARDS])
+    states[:, KNOWN_CARDS] = 0.0
+    return states
+
+
+def adapt_obs(states, obs_dim):
+    """Project the engine observation onto an older layout (a checkpoint
+    trained without the unseen channel expects the five channels + scalars)."""
+    if states.shape[-1] == obs_dim:
+        return states
+    if obs_dim == 5 * 52 + 6 and states.shape[-1] == CHANNELS_END + 6:
+        return np.concatenate([states[..., :5 * 52], states[..., CHANNELS_END:]], axis=-1)
+    raise ValueError(f"cannot adapt observation of width {states.shape[-1]} to a model expecting {obs_dim}")
 
 
 class VectorizedRummyEnv:
@@ -34,7 +54,7 @@ class VectorizedRummyEnv:
 
     def _apply_blank(self, states):
         if self.blank.any():
-            states[self.blank, KNOWN_CARDS] = 0.0
+            states[self.blank] = blank_known(states[self.blank])
         return states
 
     def reset(self):

@@ -7,8 +7,9 @@ from torch.distributions import Categorical
 class RummyActorCritic(nn.Module):
     # Layers are attributes named shared_fc1..N so a state_dict saved by the
     # original fixed 256x2 network loads unchanged into (hidden_size=256, num_layers=2).
-    def __init__(self, obs_dim=266, action_dim=105, hidden_size=512, num_layers=3):
+    def __init__(self, obs_dim=318, action_dim=105, hidden_size=512, num_layers=3):
         super().__init__()
+        self.obs_dim = obs_dim
         self.num_layers = num_layers
         in_dim = obs_dim
         for i in range(1, num_layers + 1):

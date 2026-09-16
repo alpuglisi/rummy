@@ -23,10 +23,11 @@ const int DECK_SIZE = 52;
 const int HAND_SIZE = 7;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
 // Channels: hand, discard presence, discard order, melded board, opponent's
-// publicly known cards; scalars: own hand size, opponent hand size, score
+// publicly known cards, unseen cards (still in the deck or hidden in the
+// opponent's hand); scalars: own hand size, opponent hand size, score
 // difference, then the original three meta flags (turn phase, deck fraction,
 // required meld) which stay at the end since the trainer reads obs[-3].
-const int OBS_SPACE_SIZE = DECK_SIZE * 5 + 6;
+const int OBS_SPACE_SIZE = DECK_SIZE * 6 + 6;
 
 typedef std::vector<int> Meld;
 

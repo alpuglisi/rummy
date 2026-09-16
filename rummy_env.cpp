@@ -153,7 +153,9 @@ void RummyEnv::update_observation_buffer() {
         observation_buffer[DECK_SIZE * 2 + card] = static_cast<float>(i + 1) / state.discard_pile.size();
     }
 
-    // Channel 4 & 5: melded cards (dead for everyone), opponent's known hand cards
+    // Channel 4, 5 & 6: melded cards (dead for everyone), opponent's known hand
+    // cards, and unseen cards (deck or opponent's unknown hand: anything the
+    // current player has no information about and could still be drawn).
     const int opponent = (state.current_player == 1) ? 2 : 1;
     int own_hand_size = 0, opp_hand_size = 0;
     for (int i = 0; i < DECK_SIZE; i++) {
@@ -161,7 +163,9 @@ void RummyEnv::update_observation_buffer() {
         if (state.card_locations[i] == opponent) {
             opp_hand_size++;
             if (state.publicly_known[i]) observation_buffer[DECK_SIZE * 4 + i] = 1.0f;
+            else observation_buffer[DECK_SIZE * 5 + i] = 1.0f;
         }
+        if (state.card_locations[i] == 0) observation_buffer[DECK_SIZE * 5 + i] = 1.0f;
         if (state.card_locations[i] == state.current_player) own_hand_size++;
     }
 

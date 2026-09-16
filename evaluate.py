@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 import rummy_engine
-from env.vectorized_env import KNOWN_CARDS
+from env.vectorized_env import adapt_obs, blank_known
 from models.ppo_network import RummyActorCritic
 
 
@@ -68,8 +68,8 @@ class ModelPolicy:
     @torch.no_grad()
     def act(self, obs, mask):
         if self.blank_known:
-            obs = obs.copy()
-            obs[:, KNOWN_CARDS] = 0.0
+            obs = blank_known(obs.copy())
+        obs = adapt_obs(obs, self.model.obs_dim)
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
         logits, _ = self.model(obs_t, mask_t)

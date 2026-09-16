@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 import rummy_engine
+from env.vectorized_env import adapt_obs
 
 
 class SearchPolicy:
@@ -29,6 +30,7 @@ class SearchPolicy:
 
     @torch.no_grad()
     def _logits(self, obs, mask):
+        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
         return self.model(obs_t, mask_t)[0]
