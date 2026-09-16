@@ -84,15 +84,67 @@ void RummyEnv::auto_meld(int player) {
                 }
             }
 
-            // Resolve the best meld
-            for (int c : best_meld) {
-                state.card_locations[c] = 4; // Move to board
-                if (player == 1) state.p1_score += get_point_value(c);
-                else state.p2_score += get_point_value(c);
-            }
+            place_meld(player, best_meld);
             found_meld = true; // Check again to see if remaining cards form new melds
         }
     }
+
+    // Lay off any remaining card onto a meld already on the table.
+    bool laid = true;
+    while (laid) {
+        laid = false;
+        for (int c : get_hand(player)) {
+            int idx = find_lay_off(c);
+            if (idx >= 0) {
+                lay_off_card(player, c, idx);
+                laid = true;
+                break;
+            }
+        }
+    }
+}
+
+void RummyEnv::place_meld(int player, const Meld& m) {
+    Meld sorted(m);
+    std::sort(sorted.begin(), sorted.end());
+    for (int c : sorted) {
+        state.card_locations[c] = 4;
+        if (player == 1) state.p1_score += get_point_value(c);
+        else state.p2_score += get_point_value(c);
+    }
+    state.table.push_back(sorted);
+}
+
+void RummyEnv::lay_off_card(int player, int card, int index) {
+    state.card_locations[card] = 4;
+    if (player == 1) state.p1_score += get_point_value(card);
+    else state.p2_score += get_point_value(card);
+    Meld& m = state.table[index];
+    m.push_back(card);
+    std::sort(m.begin(), m.end());
+}
+
+int RummyEnv::find_lay_off(int card) const {
+    for (size_t i = 0; i < state.table.size(); i++) {
+        if (can_lay_off(card, state.table[i])) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool RummyEnv::can_lay_off(int card, const Meld& meld) const {
+    if (card < 0 || card >= DECK_SIZE || meld.empty()) return false;
+    if (std::find(meld.begin(), meld.end(), card) != meld.end()) return false;
+    bool is_set = true;
+    for (int c : meld) if (get_rank(c) != get_rank(meld[0])) is_set = false;
+    if (is_set) return meld.size() < 4 && get_rank(card) == get_rank(meld[0]);
+    // Run: same suit, one rank below the lowest or above the highest.
+    if (get_suit(card) != get_suit(meld[0])) return false;
+    int lo = 13, hi = -1;
+    for (int c : meld) {
+        lo = std::min(lo, get_rank(c));
+        hi = std::max(hi, get_rank(c));
+    }
+    return get_rank(card) == lo - 1 || get_rank(card) == hi + 1;
 }
 
 // --- Environment Logic ---
@@ -117,6 +169,7 @@ void RummyEnv::reset() {
 
     state.card_locations.fill(0);
     state.discard_pile.clear();
+    state.table.clear();
 
     state.current_player = 1;
     state.required_meld_card = -1;
@@ -188,13 +241,21 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
     if (!state.turn_phase_is_discard) {
         // Draw Actions
         if (deck_index < DECK_SIZE) mask[0] = 1; // Can draw deck
-        // A pile draw is only legal when the deepest card taken can be melded
-        // immediately with the hand plus everything above it in the pile.
+        // A pile draw is only legal when the deepest card taken can be played
+        // immediately: melded with the hand plus everything above it in the
+        // pile, or laid off onto a meld already on the table. Either way a
+        // card must remain to discard, since going out requires a discard.
         std::vector<int> hand = get_hand(state.current_player);
         for (size_t i = 0; i < state.discard_pile.size(); i++) {
+            const int card = state.discard_pile[i];
             std::vector<int> combined(hand);
             combined.insert(combined.end(), state.discard_pile.begin() + i, state.discard_pile.end());
-            if (!find_largest_meld_with_card(combined, state.discard_pile[i]).empty()) {
+            Meld m = find_largest_meld_with_card(combined, card);
+            // A fresh meld needs a 4th card left in hand (a larger meld is
+            // trimmed to leave a discard, see the discard phase below);
+            // otherwise the card may extend a meld already on the table.
+            if ((!m.empty() && combined.size() >= 4) ||
+                (find_lay_off(card) >= 0 && combined.size() > 1)) {
                 mask[1 + i] = 1;
             }
         }
@@ -202,8 +263,29 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
         // Discard Actions
         std::vector<int> consumed_cards;
         if (state.required_meld_card != -1) {
-            state.cached_required_meld = find_largest_meld_with_card(get_hand(state.current_player), state.required_meld_card);
-            consumed_cards = state.cached_required_meld;
+            std::vector<int> hand = get_hand(state.current_player);
+            Meld m = find_largest_meld_with_card(hand, state.required_meld_card);
+            if (!m.empty() && m.size() == hand.size()) {
+                // Melding everything would leave nothing to discard: drop one
+                // end card of the meld (never the required card) so the
+                // player keeps a discard, or fall back to a lay-off when the
+                // meld is only three cards.
+                if (m.size() > 3) {
+                    std::sort(m.begin(), m.end());
+                    if (m.front() != state.required_meld_card) m.erase(m.begin());
+                    else m.pop_back();
+                } else {
+                    m.clear();
+                }
+            }
+            state.cached_required_meld = m;
+            if (m.empty() && find_lay_off(state.required_meld_card) >= 0) {
+                // The pile card extends a table meld instead: it is laid off
+                // at discard time and cannot itself be discarded.
+                consumed_cards.push_back(state.required_meld_card);
+            } else {
+                consumed_cards = m;
+            }
         }
 
         bool has_legal_discard = false;
@@ -235,7 +317,15 @@ bool RummyEnv::is_legal_action(int action) {
 }
 
 bool RummyEnv::resolve_meld(int player, int discard_card) {
-    if (state.cached_required_meld.empty()) return false;
+    if (state.cached_required_meld.empty()) {
+        // No meld from hand: the pile card must extend a meld on the table.
+        const int card = state.required_meld_card;
+        if (card == -1 || discard_card == card) return false;
+        int idx = find_lay_off(card);
+        if (idx < 0) return false;
+        lay_off_card(player, card, idx);
+        return true;
+    }
 
     // Discarding a card that's part of the required meld breaks the meld:
     // the obligation isn't satisfied, so this is a failure (-50 penalty
@@ -245,14 +335,7 @@ bool RummyEnv::resolve_meld(int player, int discard_card) {
         return false;
     }
 
-    int points = 0;
-    for (int c : state.cached_required_meld) {
-        state.card_locations[c] = 4; // move to board
-        points += get_point_value(c);
-    }
-    if (player == 1) state.p1_score += points;
-    else state.p2_score += points;
-
+    place_meld(player, state.cached_required_meld);
     state.cached_required_meld.clear(); // Clear cache
     return true;
 }
@@ -320,13 +403,6 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         //    discarded -- resolve_meld() fails if it's a member of the
         //    required meld (discarding it breaks the meld obligation).
         if (state.required_meld_card != -1) {
-            // Melding the entire hand is going out; there is no card left to discard.
-            if (state.cached_required_meld.size() == get_hand(acting_player).size()) {
-                resolve_meld(acting_player, -1);
-                float reward = settle_terminal(acting_player);
-                update_observation_buffer();
-                return {reward, true};
-            }
             bool melded = resolve_meld(acting_player, discard_card);
             if (!melded) {
                 state.is_terminal = true;
@@ -344,7 +420,8 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         // 3. Auto-meld remaining valid sets/runs to score points naturally
         if (acting_player != manual_meld_player) auto_meld(acting_player);
 
-        // Win condition: acting player emptied their hand via melding/discarding.
+        // Win condition: the acting player discarded their last card (after
+        // melding / laying off the rest). Going out always ends on a discard.
         if (get_hand(acting_player).empty()) {
             float reward = settle_terminal(acting_player);
             update_observation_buffer();
@@ -470,27 +547,50 @@ py::tuple RummyEnv::meld(const std::vector<int>& cards) {
         }
     }
     if (!is_valid_meld(cards)) throw std::invalid_argument("not a valid set or run");
-    // The card taken from the pile must be melded before anything else, so a
+    // The card taken from the pile must be played before anything else, so a
     // player cannot lay down other melds that break its only meld.
     if (state.required_meld_card != -1 &&
         std::find(cards.begin(), cards.end(), state.required_meld_card) == cards.end()) {
-        throw std::invalid_argument("you must first meld the card you took from the pile");
+        throw std::invalid_argument("you must first play the card you took from the pile");
+    }
+    const int player = state.current_player;
+    if (cards.size() >= get_hand(player).size()) {
+        throw std::invalid_argument("you must keep a card to discard");
     }
 
-    const int player = state.current_player;
-    for (int c : cards) {
-        state.card_locations[c] = 4;
-        if (player == 1) state.p1_score += get_point_value(c);
-        else state.p2_score += get_point_value(c);
-        if (c == state.required_meld_card) {
-            state.required_meld_card = -1;
-            state.cached_required_meld.clear();
-        }
+    place_meld(player, cards);
+    if (std::find(cards.begin(), cards.end(), state.required_meld_card) != cards.end()) {
+        state.required_meld_card = -1;
+        state.cached_required_meld.clear();
     }
-    if (get_hand(player).empty()) {
-        float reward = settle_terminal(player);
-        update_observation_buffer();
-        return py::make_tuple(reward, true);
+    update_observation_buffer();
+    return py::make_tuple(0.0f, false);
+}
+
+py::tuple RummyEnv::lay_off(int card, int meld_index) {
+    if (state.is_terminal) throw std::invalid_argument("game is over");
+    if (!state.turn_phase_is_discard) throw std::invalid_argument("cards are laid off after drawing");
+    if (card < 0 || card >= DECK_SIZE || state.card_locations[card] != state.current_player) {
+        throw std::invalid_argument("the card must be in your hand");
+    }
+    if (meld_index < 0 || meld_index >= static_cast<int>(state.table.size())) {
+        throw std::invalid_argument("no such meld on the table");
+    }
+    if (!can_lay_off(card, state.table[meld_index])) {
+        throw std::invalid_argument("that card does not extend this meld");
+    }
+    if (state.required_meld_card != -1 && card != state.required_meld_card) {
+        throw std::invalid_argument("you must first play the card you took from the pile");
+    }
+    const int player = state.current_player;
+    if (get_hand(player).size() < 2) {
+        throw std::invalid_argument("you must keep a card to discard");
+    }
+
+    lay_off_card(player, card, meld_index);
+    if (card == state.required_meld_card) {
+        state.required_meld_card = -1;
+        state.cached_required_meld.clear();
     }
     update_observation_buffer();
     return py::make_tuple(0.0f, false);
@@ -770,6 +870,10 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_manual_meld", &RummyEnv::get_manual_meld)
         .def("is_valid_meld", &RummyEnv::is_valid_meld, py::arg("cards"))
         .def("meld", &RummyEnv::meld, py::arg("cards"), "Lay down a set or run from hand; returns (reward, done).")
+        .def("lay_off", &RummyEnv::lay_off, py::arg("card"), py::arg("meld_index"),
+             "Add a hand card to table meld meld_index; returns (reward, done).")
+        .def("can_lay_off", &RummyEnv::can_lay_off, py::arg("card"), py::arg("meld"))
+        .def("get_table", &RummyEnv::get_table, "Melds on the table as lists of cards, oldest first.")
         .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")

@@ -39,6 +39,7 @@ struct GameState {
     // 0 = Deck, 1 = P1 Hand, 2 = P2 Hand, 3 = Discard Pile, 4 = Melded/Board
 
     std::vector<int> discard_pile; // Index 0 is oldest, back() is top card
+    std::vector<Meld> table;       // Melds on the board, in the order they were laid; lay-offs extend them
 
     int current_player;
     int required_meld_card;
@@ -73,6 +74,13 @@ private:
     std::vector<int> get_hand(int player) const;
     void auto_meld(int player);
 
+    // Board bookkeeping. place_meld moves a fresh meld from hand to the table;
+    // lay_off_card adds one hand card to table meld `index`; find_lay_off
+    // returns the first table meld the card extends, or -1.
+    void place_meld(int player, const Meld& m);
+    void lay_off_card(int player, int card, int index);
+    int find_lay_off(int card) const;
+
     // Action validation (Not const because they mutate the cache)
     std::vector<uint8_t> compute_legal_mask();
     bool is_legal_action(int action);
@@ -102,12 +110,17 @@ public:
 
     // Manual melding for a human seat. Auto-meld is skipped for that player;
     // during their discard phase they may lay down valid sets/runs with
-    // meld(). A meld containing the pile-draw's required card satisfies that
-    // obligation; melding the whole hand goes out.
+    // meld() and extend table melds with lay_off(). The card taken from the
+    // pile must be played (melded or laid off) before anything else. A player
+    // must always keep one card to discard: going out happens only by
+    // discarding the last card.
     void set_manual_meld(int player) { manual_meld_player = player; }
     int get_manual_meld() const { return manual_meld_player; }
     bool is_valid_meld(const std::vector<int>& cards) const;
     py::tuple meld(const std::vector<int>& cards);
+    bool can_lay_off(int card, const Meld& meld) const;
+    py::tuple lay_off(int card, int meld_index);
+    std::vector<Meld> get_table() const { return state.table; }
 
     // As randomize_hidden, but the opponent's unknown cards are drawn from the
     // hidden pool in proportion to weights[card] (a belief that the card is in

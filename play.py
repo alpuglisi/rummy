@@ -3,13 +3,17 @@
     python play.py archive/best_pool_235M.pth [--worlds 64 --actions 6 --seed 1 --no-search]
 
 Draw phase: click the deck, or click a discard-pile card to take the pile from
-that card up (only cards you can legally take are highlighted). Then click cards
-in your hand to select them: press M (or the button) to lay the selection down
-as a meld, as often as you like; select a single card and press D (or the
-button) to discard it and end your turn. Melding is your choice; the computer
-melds automatically, as it was trained to. Keys: A toggles the advisor (the
-search's expected outcome for each of your legal discards, assuming you lay
-down everything you can), N starts a new game, Q quits.
+that card up. Only cards you can legally take are highlighted: the deepest card
+must be playable at once, either as a new meld with your hand or laid off onto
+a meld on the table. Then click cards in your hand to select them: press M (or
+the button) to lay the selection down as a meld, or select one card and click
+a meld on the table to lay it off, as often as you like. Finally select a
+single card and press D (or the button) to discard it and end your turn. You
+must always keep one card to discard; the only way to go out is to discard
+your last card. The computer melds and lays off automatically, as it was
+trained to. Keys: A toggles the advisor (the search's expected outcome for
+each of your legal moves, assuming you lay down everything you can), N starts
+a new game, Q quits.
 """
 import argparse
 import os
@@ -25,6 +29,7 @@ from search import SearchPolicy
 
 WIDTH, HEIGHT = 1280, 800
 CARD_W, CARD_H = 80, 116
+TABLE_W, TABLE_H = 56, 81          # melds on the table are drawn smaller
 SUITS = ["clubs", "diamonds", "hearts", "spades"]
 RANKS = ["ace", "2", "3", "4", "5", "6", "7", "8", "9", "10", "jack", "queen", "king"]
 GREEN = (30, 100, 60)
@@ -41,6 +46,7 @@ def card_name(card):
 class Assets:
     def __init__(self, folder="assets/cards"):
         self.faces = {}
+        self.small_faces = {}
         for card in range(52):
             rank, suit = RANKS[card % 13], SUITS[card // 13]
             path = os.path.join(folder, f"{rank}_of_{suit}2.png")   # court illustrations where available
@@ -48,6 +54,7 @@ class Assets:
                 path = os.path.join(folder, f"{rank}_of_{suit}.png")
             img = pygame.image.load(path).convert_alpha()
             self.faces[card] = pygame.transform.smoothscale(img, (CARD_W, CARD_H))
+            self.small_faces[card] = pygame.transform.smoothscale(img, (TABLE_W, TABLE_H))
         self.back = pygame.Surface((CARD_W, CARD_H), pygame.SRCALPHA)
         pygame.draw.rect(self.back, (250, 250, 250), self.back.get_rect(), border_radius=8)
         pygame.draw.rect(self.back, (40, 60, 140), self.back.get_rect().inflate(-10, -10), border_radius=6)
@@ -103,6 +110,9 @@ class Game:
     def board(self):
         return np.flatnonzero(self.obs()[156:208] == 1.0)
 
+    def table(self):
+        return self.env.get_table()
+
     def opponent_size(self):
         return int(self.env.get_opponent_hand().sum()) if self.env.get_current_player() == self.human \
             else int(self.obs()[:52].sum())
@@ -154,6 +164,26 @@ class Game:
 
     def can_discard(self):
         return len(self.selected) == 1 and self.legal()[53 + next(iter(self.selected))]
+
+    def can_lay_off(self, meld_index):
+        if len(self.selected) != 1 or len(self.hand()) < 2:
+            return False
+        return self.env.can_lay_off(next(iter(self.selected)), self.table()[meld_index])
+
+    def lay_off_selected(self, meld_index):
+        if not self.can_lay_off(meld_index):
+            return
+        card = next(iter(self.selected))
+        try:
+            reward, done = self.env.lay_off(card, meld_index)
+        except ValueError as err:
+            self.log.append(f"Can't lay that off: {err}.")
+            return
+        self.selected.clear()
+        self.log.append(f"You laid off {card_name(card)}.")
+        if done:
+            self.finish(reward, "You")
+        self.refresh_advice()
 
     def meld_selected(self):
         if not self.can_meld():
@@ -232,12 +262,22 @@ class View:
         for _ in range(max(0, opp_n - len(opp_known))):
             self.card(0, x, 45, face=False); x += 26
 
-        # Board (melded cards)
-        board = g.board()
-        self.text(f"Melded ({len(board)} cards)", 20, 175, self.font, DIM)
-        x = 20
-        for card in board:
-            self.card(int(card), x, 198); x += 34 if len(board) > 30 else 46
+        # Table: each meld is a group; a single selected hand card can be laid
+        # off by clicking a group it extends.
+        table = g.table()
+        self.text(f"Table ({len(table)} melds)", 20, 175, self.font, DIM)
+        x, y = 20, 198
+        for idx, meld in enumerate(table):
+            width = TABLE_W + 18 * (len(meld) - 1)
+            if x + width > WIDTH - 20:
+                x, y = 20, y + 54
+            rect = pygame.Rect(x, y, width, TABLE_H)
+            for k, card in enumerate(meld):
+                s.blit(self.assets.small_faces[int(card)], (x + 18 * k, y))
+            if human_turn and discard and g.can_lay_off(idx):
+                pygame.draw.rect(s, HIGHLIGHT, rect.inflate(6, 6), 3, border_radius=6)
+                self.hit.append((rect, ("layoff", idx)))
+            x += width + 16
 
         # Deck + pile (middle)
         deck_left = 52 - int(round(float(g.obs()[-2]) * 52))
@@ -287,8 +327,12 @@ class View:
         if g.result:
             status = g.result
         elif human_turn:
-            status = "Your turn: " + ("select cards to meld (M), or one card to discard (D)."
-                                      if discard else "click the deck or a pile card you can take.")
+            if not discard:
+                status = "Your turn: click the deck or a pile card you can take."
+            elif len(g.selected) == 1:
+                status = "Your turn: click a highlighted table meld to lay off, or D to discard."
+            else:
+                status = "Your turn: select cards to meld (M), or one card to lay off / discard (D)."
         else:
             status = "Computer is thinking..."
         self.text(status, 20, 690, self.font, HIGHLIGHT)
@@ -362,6 +406,8 @@ def main():
                         game.toggle_select(value)
                     elif kind == "meld":
                         game.meld_selected()
+                    elif kind == "layoff":
+                        game.lay_off_selected(value)
                     elif kind == "discard":
                         game.discard_selected()
                         view.draw(game)
