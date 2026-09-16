@@ -7,6 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.vectorized_env import VectorizedRummyEnv
 from models.ppo_network import RummyActorCritic
 from config import PPOConfig
+from evaluate import ModelPolicy, RandomPolicy, play_matches
 
 class RolloutBuffer:
     def __init__(self, cfg: PPOConfig, device: torch.device):
@@ -73,6 +74,7 @@ class PPOTrainer:
         done = torch.zeros(self.cfg.num_envs, dtype=torch.bool).to(self.device)
         
         global_step = 0
+        update = 0
         while global_step < self.cfg.total_timesteps:
             for _ in range(self.cfg.num_steps):
                 with torch.no_grad():
@@ -103,6 +105,10 @@ class PPOTrainer:
             
             self.buffer.clear()
             print(f"Global Step: {global_step} / {self.cfg.total_timesteps}")
+
+            update += 1
+            if update % self.cfg.eval_interval == 0:
+                self.evaluate(global_step)
             
             current_millions = global_step // 1_000_000
 
@@ -171,6 +177,20 @@ class PPOTrainer:
                 batches += 1
                 
         return total_a_loss / batches, total_c_loss / batches
+
+    def evaluate(self, global_step):
+        self.model.eval()
+        stats = play_matches(
+            ModelPolicy(self.model, self.device), RandomPolicy(global_step),
+            self.cfg.eval_games, seed=global_step,
+        )
+        self.model.train()
+        self.writer.add_scalar("Eval/WinRate_vs_Random", stats["win_rate"], global_step)
+        self.writer.add_scalar("Eval/DrawRate_vs_Random", stats["draw_rate"], global_step)
+        self.writer.add_scalar("Eval/PenaltyRate", stats["penalty_rate"], global_step)
+        self.writer.add_scalar("Eval/MeanTurns", stats["mean_turns"], global_step)
+        print(f"  Eval vs random: win {stats['win_rate']:.1%}, penalty {stats['penalty_rate']:.1%}, "
+              f"{stats['mean_turns']:.1f} turns")
 
     def save_checkpoint(self, path: str):
         directory = os.path.dirname(path)

@@ -21,5 +21,9 @@ class PPOConfig:
     ent_coef: float = 0.01     
     vf_coef: float = 0.5       
     
+    # Evaluation (win rate vs a random opponent, logged to TensorBoard)
+    eval_interval: int = 5     # Run every N PPO updates
+    eval_games: int = 256
+
     # System
     device: str = "cuda"
