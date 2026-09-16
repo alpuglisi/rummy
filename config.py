@@ -16,7 +16,7 @@ class PPOConfig:
     residual: bool = True      # LayerNorm residual trunk; False gives the original plain MLP
 
     # Training Parameters
-    total_timesteps: int = 50_000_000
+    total_timesteps: int = 100_000_000
     learning_rate: float = 3e-4
     epochs: int = 4
     batch_size: int = 2048
@@ -43,12 +43,12 @@ class PPOConfig:
     # Expert iteration: every distill_every updates, run the search on live
     # training positions (rollouts always play to the end of the game) and pull
     # the policy toward the search's action distribution.
-    distill_every: int = 4
+    distill_every: int = 8
     distill_positions: int = 256
-    distill_worlds: int = 16
+    distill_worlds: int = 64       # +-7 pts per candidate outcome; 16 worlds was +-15, noisier than the temperature
     distill_actions: int = 4
     distill_coef: float = 0.5        # Weight of the distillation loss next to the PPO loss; 0 disables
-    distill_temperature: float = 10.0  # Points; softmax over candidate outcomes / temperature
+    distill_temperature: float = 15.0  # Points; softmax over candidate outcomes / temperature
 
     # System
     device: str = "cuda"
