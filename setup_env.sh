@@ -48,6 +48,7 @@ else
 fi
 
 echo "==> Building rummy_engine C++ extension"
+rm -rf build  # setuptools skips the rebuild after header-only changes otherwise
 $PY -m pip install -q --no-build-isolation --force-reinstall --no-deps .
 
 echo "==> Verifying"

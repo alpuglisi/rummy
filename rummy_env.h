@@ -16,7 +16,7 @@
 namespace py = pybind11;
 
 const int DECK_SIZE = 52;
-const int HAND_SIZE = 10;
+const int HAND_SIZE = 7;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
 // Channels: hand, discard presence, discard order, melded board, opponent's
 // publicly known cards; scalars: own hand size, opponent hand size, score
