@@ -1,0 +1,12 @@
+# Roboflow-style yolov8 export (paths are relative to the yaml's parent, roboflow quirk)
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['10C', '10D', 'AS', 'KH', 'joker', 'banana']
+
+roboflow:
+  workspace: fixture
+  project: playing-cards
+  version: 1

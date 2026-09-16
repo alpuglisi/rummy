@@ -10,10 +10,15 @@ Canonical on-disk layout (used for downloaded, converted and synthetic data)::
 
 Ultralytics locates a label by replacing the last ``/images/`` in an image path
 with ``/labels/``, so alternative label sets for the same images live in
-"views" whose ``images`` entry is a symlink (or copy) of the real image dir::
+"views".  Ultralytics *resolves symlinks* of the split directories it is given
+(``check_det_dataset``), so a view must NOT make ``images`` a single directory
+symlink to ``../../images``: the resolved path would then land on the primary
+labels.  ``make_view`` therefore builds real split directories holding one
+relative symlink (or copy) per image file, which ``resolve()`` leaves inside the
+view::
 
-    <dataset_root>/views/<name>/images -> ../../images
-    <dataset_root>/views/<name>/labels/{train,val}/*.txt
+    <dataset_root>/views/<name>/images/{train,val}/*.jpg -> ../../../../images/{train,val}/*.jpg
+    <dataset_root>/views/<name>/labels -> <labels_src>       (a directory symlink is fine here)
 
 Label formats
 -------------
@@ -28,6 +33,8 @@ objects.  Never mix semantics inside one training run.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -35,6 +42,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import yaml
+
+log = logging.getLogger("vision.labels")
 
 IMG_EXTS: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 SPLITS: Tuple[str, ...] = ("train", "val", "test")
@@ -70,17 +79,21 @@ def polygon_area(points: Sequence[Point]) -> float:
 
 
 def order_quad(points: Sequence[Point]) -> List[Point]:
-    """Return the 4 points ordered top-left, top-right, bottom-right, bottom-left."""
+    """Return the 4 points ordered top-left, top-right, bottom-right, bottom-left.
+
+    The points are sorted by polar angle around their centroid (one consistent cycle around
+    the quad, so every input point appears exactly once) and the cycle is started at the
+    corner with the smallest ``x + y``.  Selecting each corner independently by min/max of
+    ``x + y`` / ``x - y`` is wrong for rotated quads: two selections can pick the same point.
+    """
     pts = [tuple(map(float, p)) for p in points]
     if len(pts) != 4:
         raise ValueError("order_quad expects exactly 4 points")
-    s = [p[0] + p[1] for p in pts]
-    d = [p[0] - p[1] for p in pts]
-    tl = pts[s.index(min(s))]
-    br = pts[s.index(max(s))]
-    tr = pts[d.index(max(d))]
-    bl = pts[d.index(min(d))]
-    return [tl, tr, br, bl]
+    cx = sum(p[0] for p in pts) / 4.0
+    cy = sum(p[1] for p in pts) / 4.0
+    pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    start = min(range(4), key=lambda k: pts[k][0] + pts[k][1])
+    return pts[start:] + pts[:start]
 
 
 # --------------------------------------------------------------------------- label records
@@ -252,11 +265,30 @@ def iter_split(root: PathLike, split: str) -> Iterator[Tuple[Path, Path]]:
         yield img, lbl_dir / (img.stem + ".txt")
 
 
+def _resolves_to(link: Path, target: Path) -> bool:
+    """True when the symlink ``link`` is not dangling and resolves to the same path as ``target``."""
+    try:
+        return link.exists() and link.resolve() == target.resolve()
+    except (OSError, RuntimeError):   # RuntimeError: symlink loop (Python < 3.13)
+        return False
+
+
 def link_or_copy(src: PathLike, dst: PathLike, copy: bool = False) -> None:
-    """Symlink ``dst -> src`` (relative), falling back to a copy when symlinks fail."""
+    """Symlink ``dst -> src`` (relative), falling back to a copy when symlinks fail.
+
+    An existing symlink at ``dst`` is kept only when it still resolves to ``src`` and no copy
+    was requested; a dangling link, one that points elsewhere, or a link where ``copy`` is now
+    wanted is replaced.  A real file or directory already at ``dst`` is kept with a warning
+    (its content cannot be verified here).
+    """
     src, dst = Path(src), Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() or dst.is_symlink():
+    if dst.is_symlink():
+        if not copy and _resolves_to(dst, src):
+            return
+        dst.unlink()   # dangling, pointing elsewhere or a copy was requested: recreate below
+    elif dst.exists():
+        log.warning("%s already exists and is not a symlink; keeping it (wanted %s)", dst, src)
         return
     if not copy:
         try:
@@ -270,13 +302,29 @@ def link_or_copy(src: PathLike, dst: PathLike, copy: bool = False) -> None:
         shutil.copy2(src, dst)
 
 
-def make_view(root: PathLike, name: str, labels_src: PathLike, copy: bool = False) -> Path:
-    """Create ``<root>/views/<name>`` whose ``images`` points at ``<root>/images``
-    and whose ``labels`` points at ``labels_src``.  Returns the view root."""
+def make_view(root: PathLike, name: str, labels_src: PathLike, copy: bool = False,
+              splits: Sequence[str] = SPLITS) -> Path:
+    """Create ``<root>/views/<name>``: ``images/<split>/`` are real directories holding one
+    symlink (or copy) per image of ``<root>/images/<split>`` and ``labels`` points at
+    ``labels_src``.  Returns the view root.
+
+    Images are linked per file rather than as one ``images -> ../../images`` directory symlink
+    because ultralytics resolves the split directories before deriving label paths (see the
+    module docstring); a leftover directory symlink of that older layout is replaced.
+    """
     root = Path(root)
     view = root / "views" / name
     view.mkdir(parents=True, exist_ok=True)
-    link_or_copy(root / "images", view / "images", copy=copy)
+    img_root = view / "images"
+    if img_root.is_symlink():
+        img_root.unlink()
+    for split in splits:
+        src_dir = root / "images" / split
+        if not src_dir.is_dir():
+            continue
+        (img_root / split).mkdir(parents=True, exist_ok=True)
+        for img in list_images(src_dir):
+            link_or_copy(img, img_root / split / img.name, copy=copy)
     link_or_copy(Path(labels_src), view / "labels", copy=copy)
     return view
 

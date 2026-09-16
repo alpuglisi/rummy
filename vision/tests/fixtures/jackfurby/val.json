@@ -1,0 +1,4 @@
+{
+  "2": {"img_path": "imgs/deck_a/2.png", "class_label": 2, "concept_label": [0, 0, 1],
+        "card_points": [[[[5, 5], [45, 5], [5, 65], [45, 65]], 16]]}
+}
