@@ -362,6 +362,33 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
     }
 }
 
+void RummyEnv::randomize_hidden(uint32_t seed) {
+    const int opponent = (state.current_player == 1) ? 2 : 1;
+    std::vector<int> pool;
+    int unknown_in_hand = 0;
+    for (int c = 0; c < DECK_SIZE; c++) {
+        if (state.card_locations[c] == opponent && !state.publicly_known[c]) {
+            pool.push_back(c);
+            unknown_in_hand++;
+        }
+    }
+    for (int i = deck_index; i < DECK_SIZE; i++) pool.push_back(deck_order[i]);
+
+    std::mt19937 gen(seed);
+    std::shuffle(pool.begin(), pool.end(), gen);
+
+    for (size_t k = 0; k < pool.size(); k++) {
+        if (static_cast<int>(k) < unknown_in_hand) {
+            state.card_locations[pool[k]] = static_cast<int8_t>(opponent);
+        } else {
+            state.card_locations[pool[k]] = 0;
+            deck_order[deck_index + (k - unknown_in_hand)] = pool[k];
+        }
+    }
+    rng.seed(seed ^ 0x9e3779b9u);
+    update_observation_buffer();
+}
+
 float RummyEnv::get_score(int player) const {
     return (player == 1) ? state.p1_score : state.p2_score;
 }
@@ -445,7 +472,10 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("is_done", &RummyEnv::is_done)
         .def("get_score", &RummyEnv::get_score)
         .def("get_legal_actions", &RummyEnv::get_legal_actions)
-        .def("get_state", &RummyEnv::get_state);
+        .def("get_state", &RummyEnv::get_state)
+        .def("get_current_player", &RummyEnv::get_current_player)
+        .def("randomize_hidden", &RummyEnv::randomize_hidden, py::arg("seed"))
+        .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
         .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)

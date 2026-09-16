@@ -111,7 +111,10 @@ def play_matches(agent, opponent, num_games, seed=0):
 
         actions = np.empty(len(live), dtype=np.int64)
         if agent_turn.any():
-            actions[agent_turn] = agent.act(obs[agent_turn], mask[agent_turn])
+            if getattr(agent, "needs_env", False):
+                actions[agent_turn] = agent.act_envs([envs[i] for i in live[agent_turn]])
+            else:
+                actions[agent_turn] = agent.act(obs[agent_turn], mask[agent_turn])
         if (~agent_turn).any():
             actions[~agent_turn] = opponent.act(obs[~agent_turn], mask[~agent_turn])
 

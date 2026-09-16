@@ -85,6 +85,12 @@ public:
 
     bool is_done() const { return state.is_terminal; }
     float get_score(int player) const;
+    int get_current_player() const { return state.current_player; }
+
+    // Redeal the cards the current player cannot see (opponent's unknown hand
+    // cards and the undrawn deck) at random. The current player's observation
+    // is unchanged, so search over clones never uses hidden information.
+    void randomize_hidden(uint32_t seed);
 
     py::array_t<uint8_t> get_legal_actions();
     py::array_t<float> get_state() const;

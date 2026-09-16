@@ -6,8 +6,7 @@ class PPOConfig:
     num_envs: int = 64
     num_steps: int = 512       # Steps per environment before an update
     env_threads: int = 1       # C++ threads for stepping envs; >1 only pays off with hundreds of envs
-    blank_known_prob: float = 1.0  # Fraction of games that hide the opponent-known-cards channel
-                                   # (measured to add nothing at 5000 games; the app need not track it)
+    blank_known_prob: float = 0.5  # Fraction of games that hide the opponent-known-cards channel
     obs_dim: int = 266         # Must match OBS_SPACE_SIZE in rummy_env.h
     action_dim: int = 105
     
