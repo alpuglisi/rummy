@@ -3,9 +3,9 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Environment Setup
-    num_envs: int = 64
-    num_steps: int = 512       # Steps per environment before an update
-    env_threads: int = 1       # C++ threads for stepping envs; >1 only pays off with hundreds of envs
+    num_envs: int = 512
+    num_steps: int = 128       # Steps per environment before an update (65,536 samples)
+    env_threads: int = 0       # C++ threads for stepping envs; 0 = one per CPU core
     blank_known_prob: float = 0.5  # Fraction of games that hide the opponent-known-cards channel
     obs_dim: int = 266         # Must match OBS_SPACE_SIZE in rummy_env.h
     action_dim: int = 105
@@ -18,7 +18,7 @@ class PPOConfig:
     total_timesteps: int = 50_000_000
     learning_rate: float = 3e-4
     epochs: int = 4
-    batch_size: int = 1024
+    batch_size: int = 2048
     
     # PPO Math
     reward_scale: float = 0.02  # Engine rewards are +-100 at game end; keep value targets O(1)

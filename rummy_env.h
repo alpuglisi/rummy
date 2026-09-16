@@ -7,11 +7,15 @@
 #include <algorithm>
 #include <stdexcept>
 #include <exception>
+#include <condition_variable>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 
@@ -99,40 +103,50 @@ public:
     std::vector<uint8_t> legal_mask() { return compute_legal_mask(); }
 };
 
+// Persistent worker threads. run(fn) calls fn(worker_index, num_workers) on
+// every worker and blocks until all have finished; per-step thread creation
+// was more expensive than the work itself for a few hundred envs.
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable start_cv, done_cv;
+    std::function<void(int, int)> task;
+    uint64_t generation = 0;
+    int pending = 0;
+    bool stopping = false;
+    std::exception_ptr error;
+
+    void worker_loop(int index);
+
+public:
+    explicit ThreadPool(int num_workers);
+    ~ThreadPool();
+    int size() const { return static_cast<int>(workers.size()); }
+    void run(const std::function<void(int, int)>& fn);
+};
+
+// Run fn(i) for i in [0, n) across the pool, or inline when there is no pool.
+template <typename F>
+void parallel_for(ThreadPool* pool, int n, F&& fn) {
+    if (!pool || pool->size() <= 1 || n < 2) {
+        for (int i = 0; i < n; i++) fn(i);
+        return;
+    }
+    pool->run([&](int k, int t) {
+        for (int i = k; i < n; i += t) fn(i);
+    });
+}
+
+void write_observation(const RummyEnv& env, int i, float* states, bool* masks);
+
 // Steps N independent engines in one call with the GIL released, optionally
 // across a fixed number of threads. Terminal games are reset automatically and
 // the returned state/mask are from the fresh game.
 class VectorizedRummyEnv {
 private:
     std::vector<RummyEnv> envs;
-    int num_threads;
-
-    template <typename F>
-    void for_each_env(F&& fn) {
-        const int n = static_cast<int>(envs.size());
-        const int t = std::min(num_threads, n);
-        if (t <= 1) {
-            for (int i = 0; i < n; i++) fn(i);
-            return;
-        }
-        std::vector<std::thread> threads;
-        std::exception_ptr error;
-        std::mutex error_mutex;
-        for (int k = 0; k < t; k++) {
-            threads.emplace_back([&, k]() {
-                try {
-                    for (int i = k; i < n; i += t) fn(i);
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(error_mutex);
-                    if (!error) error = std::current_exception();
-                }
-            });
-        }
-        for (auto& th : threads) th.join();
-        if (error) std::rethrow_exception(error);
-    }
-
-    void write_obs(int i, float* states, bool* masks);
+    std::unique_ptr<ThreadPool> pool;
 
 public:
     VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads);
@@ -140,4 +154,25 @@ public:
     int size() const { return static_cast<int>(envs.size()); }
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
+};
+
+// A batch of arbitrary games (copied from Python RummyEnv objects) stepped in
+// parallel without auto-reset: finished games keep their terminal state and
+// ignore further actions. Used for evaluation matches and search rollouts.
+class EnvBatch {
+private:
+    std::vector<RummyEnv> envs;
+    std::vector<uint8_t> alive;
+    std::unique_ptr<ThreadPool> pool;
+
+public:
+    EnvBatch(const std::vector<RummyEnv>& sources, int num_threads);
+
+    int size() const { return static_cast<int>(envs.size()); }
+    RummyEnv get(int i) const { return envs.at(i); }
+    py::array_t<bool> alive_mask() const;
+    py::tuple observe();
+    py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
+    py::array_t<float> scores() const;
+    void randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds);
 };

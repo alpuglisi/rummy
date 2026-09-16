@@ -402,21 +402,79 @@ py::array_t<float> RummyEnv::get_state() const {
     return py::array_t<float>(observation_buffer.size(), observation_buffer.data());
 }
 
+// --- Thread Pool ---
+
+ThreadPool::ThreadPool(int num_workers) {
+    for (int k = 0; k < num_workers; k++) {
+        workers.emplace_back([this, k]() { worker_loop(k); });
+    }
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopping = true;
+    }
+    start_cv.notify_all();
+    for (auto& th : workers) th.join();
+}
+
+void ThreadPool::worker_loop(int index) {
+    uint64_t seen = 0;
+    while (true) {
+        std::function<void(int, int)> fn;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            start_cv.wait(lock, [&] { return stopping || generation != seen; });
+            if (stopping) return;
+            seen = generation;
+            fn = task;
+        }
+        try {
+            fn(index, static_cast<int>(workers.size()));
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!error) error = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (--pending == 0) done_cv.notify_one();
+        }
+    }
+}
+
+void ThreadPool::run(const std::function<void(int, int)>& fn) {
+    std::unique_lock<std::mutex> lock(mutex);
+    task = fn;
+    error = nullptr;
+    pending = static_cast<int>(workers.size());
+    generation++;
+    start_cv.notify_all();
+    done_cv.wait(lock, [&] { return pending == 0; });
+    if (error) std::rethrow_exception(error);
+}
+
+static std::unique_ptr<ThreadPool> make_pool(int num_threads, int num_envs) {
+    const int t = std::min(num_threads, num_envs);
+    if (t <= 1) return nullptr;
+    return std::make_unique<ThreadPool>(t);
+}
+
+void write_observation(const RummyEnv& env, int i, float* states, bool* masks) {
+    const std::vector<float>& obs = env.observation();
+    std::copy(obs.begin(), obs.end(), states + static_cast<size_t>(i) * OBS_SPACE_SIZE);
+    std::vector<uint8_t> mask = const_cast<RummyEnv&>(env).legal_mask();
+    bool* row = masks + static_cast<size_t>(i) * ACTION_SPACE_SIZE;
+    for (int a = 0; a < ACTION_SPACE_SIZE; a++) row[a] = mask[a] != 0;
+}
+
 // --- Vectorized Environment ---
 
-VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads)
-    : num_threads(std::max(1, num_threads)) {
+VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads) {
     if (num_envs <= 0) throw std::invalid_argument("num_envs must be positive");
     envs.reserve(num_envs);
     for (int i = 0; i < num_envs; i++) envs.emplace_back(seed + static_cast<uint32_t>(i));
-}
-
-void VectorizedRummyEnv::write_obs(int i, float* states, bool* masks) {
-    const std::vector<float>& obs = envs[i].observation();
-    std::copy(obs.begin(), obs.end(), states + static_cast<size_t>(i) * OBS_SPACE_SIZE);
-    std::vector<uint8_t> mask = envs[i].legal_mask();
-    bool* row = masks + static_cast<size_t>(i) * ACTION_SPACE_SIZE;
-    for (int a = 0; a < ACTION_SPACE_SIZE; a++) row[a] = mask[a] != 0;
+    pool = make_pool(num_threads, num_envs);
 }
 
 py::tuple VectorizedRummyEnv::reset() {
@@ -427,9 +485,9 @@ py::tuple VectorizedRummyEnv::reset() {
     bool* m = masks.mutable_data();
     {
         py::gil_scoped_release release;
-        for_each_env([&](int i) {
+        parallel_for(pool.get(), n, [&](int i) {
             envs[i].reset();
-            write_obs(i, s, m);
+            write_observation(envs[i], i, s, m);
         });
     }
     return py::make_tuple(states, masks);
@@ -452,15 +510,96 @@ py::tuple VectorizedRummyEnv::step(py::array_t<int64_t, py::array::c_style | py:
     bool* d = dones.mutable_data();
     {
         py::gil_scoped_release release;
-        for_each_env([&](int i) {
+        parallel_for(pool.get(), n, [&](int i) {
             auto result = envs[i].step_raw(static_cast<int>(a[i]));
             if (result.second) envs[i].reset();
             r[i] = result.first;
             d[i] = result.second;
-            write_obs(i, s, m);
+            write_observation(envs[i], i, s, m);
         });
     }
     return py::make_tuple(states, masks, rewards, dones);
+}
+
+// --- Env Batch ---
+
+EnvBatch::EnvBatch(const std::vector<RummyEnv>& sources, int num_threads)
+    : envs(sources), alive(sources.size(), 1) {
+    if (envs.empty()) throw std::invalid_argument("EnvBatch needs at least one environment");
+    for (size_t i = 0; i < envs.size(); i++) alive[i] = envs[i].is_done() ? 0 : 1;
+    pool = make_pool(num_threads, static_cast<int>(envs.size()));
+}
+
+py::array_t<bool> EnvBatch::alive_mask() const {
+    py::array_t<bool> out(size());
+    bool* o = out.mutable_data();
+    for (int i = 0; i < size(); i++) o[i] = alive[i] != 0;
+    return out;
+}
+
+py::tuple EnvBatch::observe() {
+    const int n = size();
+    py::array_t<float> states({n, OBS_SPACE_SIZE});
+    py::array_t<bool> masks({n, ACTION_SPACE_SIZE});
+    py::array_t<int32_t> players(n);
+    float* s = states.mutable_data();
+    bool* m = masks.mutable_data();
+    int32_t* p = players.mutable_data();
+    {
+        py::gil_scoped_release release;
+        parallel_for(pool.get(), n, [&](int i) {
+            write_observation(envs[i], i, s, m);
+            p[i] = envs[i].get_current_player();
+        });
+    }
+    return py::make_tuple(states, masks, players);
+}
+
+py::tuple EnvBatch::step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions) {
+    const int n = size();
+    if (actions.ndim() != 1 || actions.shape(0) != n) {
+        throw std::invalid_argument("actions must be a 1-D array with one entry per environment");
+    }
+    const int64_t* a = actions.data();
+    py::array_t<float> rewards(n);
+    py::array_t<bool> dones(n);
+    float* r = rewards.mutable_data();
+    bool* d = dones.mutable_data();
+    {
+        py::gil_scoped_release release;
+        parallel_for(pool.get(), n, [&](int i) {
+            if (!alive[i]) {
+                r[i] = 0.0f;
+                d[i] = true;
+                return;
+            }
+            auto result = envs[i].step_raw(static_cast<int>(a[i]));
+            r[i] = result.first;
+            d[i] = result.second;
+            if (result.second) alive[i] = 0;
+        });
+    }
+    return py::make_tuple(rewards, dones);
+}
+
+py::array_t<float> EnvBatch::scores() const {
+    py::array_t<float> out({size(), 2});
+    float* o = out.mutable_data();
+    for (int i = 0; i < size(); i++) {
+        o[2 * i] = envs[i].get_score(1);
+        o[2 * i + 1] = envs[i].get_score(2);
+    }
+    return out;
+}
+
+void EnvBatch::randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds) {
+    const int n = size();
+    if (seeds.ndim() != 1 || seeds.shape(0) != n) {
+        throw std::invalid_argument("seeds must be a 1-D array with one entry per environment");
+    }
+    const uint32_t* sd = seeds.data();
+    py::gil_scoped_release release;
+    parallel_for(pool.get(), n, [&](int i) { envs[i].randomize_hidden(sd[i]); });
 }
 
 // --- Pybind11 Module Definition ---
@@ -480,7 +619,17 @@ PYBIND11_MODULE(rummy_engine, m) {
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
         .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)
         .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
-        .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,159] float32, masks[N,105] bool).")
+        .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,obs], masks[N,105] bool).")
         .def("step", &VectorizedRummyEnv::step,
              "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");
+
+    py::class_<EnvBatch>(m, "EnvBatch")
+        .def(py::init<const std::vector<RummyEnv>&, int>(), py::arg("envs"), py::arg("num_threads") = 1)
+        .def_property_readonly("size", &EnvBatch::size)
+        .def("get", &EnvBatch::get, "Copy of game i.")
+        .def("alive", &EnvBatch::alive_mask)
+        .def("observe", &EnvBatch::observe, "Returns (states, masks, current_players[N] int32).")
+        .def("step", &EnvBatch::step, "Returns (rewards, dones); finished games are left as they are.")
+        .def("scores", &EnvBatch::scores, "Returns [N,2] scores for players 1 and 2.")
+        .def("randomize_hidden", &EnvBatch::randomize_hidden, py::arg("seeds"));
 }

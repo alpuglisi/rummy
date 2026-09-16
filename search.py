@@ -1,5 +1,9 @@
+import os
+
 import numpy as np
 import torch
+
+import rummy_engine
 
 
 class SearchPolicy:
@@ -9,33 +13,34 @@ class SearchPolicy:
     candidate action out to the end of the game in each world with the model
     driving both players, and pick the action with the best mean outcome from
     the searching player's perspective. Candidate actions are the model's
-    `max_actions` most likely legal moves.
+    `max_actions` most likely legal moves. All rollouts for all decisions are
+    stepped together in one threaded EnvBatch.
     """
 
     needs_env = True
 
-    def __init__(self, model, device, worlds=16, max_actions=4, seed=0):
+    def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0):
         self.model = model
         self.device = device
         self.worlds = worlds
         self.max_actions = max_actions
         self.rng = np.random.default_rng(seed)
+        self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 1)
 
     @torch.no_grad()
-    def _policy(self, obs, mask):
-        obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=self.device)
-        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
-        logits, _ = self.model(obs_t, mask_t)
-        return logits
+    def _logits(self, obs, mask):
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        return self.model(obs_t, mask_t)[0]
 
     def _sample(self, obs, mask):
-        return torch.distributions.Categorical(logits=self._policy(obs, mask)).sample().cpu().numpy()
+        return torch.distributions.Categorical(logits=self._logits(obs, mask)).sample().cpu().numpy()
 
     def evaluate_actions(self, envs):
         """Return, per env, a dict {action: (mean_outcome, n_rollouts)} for its candidates."""
         obs = np.stack([e.get_state() for e in envs])
         mask = np.stack([e.get_legal_actions() for e in envs]).astype(bool)
-        probs = torch.softmax(self._policy(obs, mask), dim=-1).cpu().numpy()
+        probs = torch.softmax(self._logits(obs, mask), dim=-1).cpu().numpy()
 
         candidates = []
         for i in range(len(envs)):
@@ -43,44 +48,52 @@ class SearchPolicy:
             order = legal[np.argsort(-probs[i, legal])]
             candidates.append(order[: self.max_actions])
 
-        # One rollout per (env, world, candidate); all advanced in lockstep.
-        clones, tags, agents = [], [], []
-        totals = [{int(a): [0.0, 0] for a in c} for c in candidates]
+        # One rollout per (env, world, candidate). Worlds are built once per env
+        # and copied per candidate so every candidate faces the same redeals.
+        sims, sim_env, sim_action, sim_agent = [], [], [], []
         for i, env in enumerate(envs):
             agent = env.get_current_player()
-            for w in range(self.worlds):
+            for _ in range(self.worlds):
                 world = env.clone()
                 world.randomize_hidden(int(self.rng.integers(0, 2**31)))
                 for a in candidates[i]:
-                    sim = world.clone()
-                    reward, done = sim.step(int(a))
-                    if done:
-                        totals[i][int(a)][0] += reward   # the searcher acted, so reward is already ours
-                        totals[i][int(a)][1] += 1
-                    else:
-                        clones.append(sim)
-                        tags.append((i, int(a)))
-                        agents.append(agent)
+                    sims.append(world.clone())
+                    sim_env.append(i)
+                    sim_action.append(int(a))
+                    sim_agent.append(agent)
+        sim_env = np.array(sim_env)
+        sim_action = np.array(sim_action, dtype=np.int64)
+        sim_agent = np.array(sim_agent, dtype=np.int32)
 
-        while clones:
-            obs = np.stack([c.get_state() for c in clones])
-            mask = np.stack([c.get_legal_actions() for c in clones]).astype(bool)
-            actions = self._sample(obs, mask)
-            survivors, survivor_tags, survivor_agents = [], [], []
-            for c, (i, a), agent, act in zip(clones, tags, agents, actions):
-                actor = c.get_current_player()
-                reward, done = c.step(int(act))
-                if done:
-                    outcome = reward if actor == agent else -reward
-                    totals[i][a][0] += outcome
-                    totals[i][a][1] += 1
-                else:
-                    survivors.append(c)
-                    survivor_tags.append((i, a))
-                    survivor_agents.append(agent)
-            clones, tags, agents = survivors, survivor_tags, survivor_agents
+        batch = rummy_engine.EnvBatch(sims, self.num_threads)
+        n = batch.size
+        outcome = np.zeros(n, dtype=np.float64)
+        actor = np.full(n, sim_agent, dtype=np.int32)
+        rewards, dones = batch.step(sim_action)
+        finished = dones.copy()
+        outcome[finished] = rewards[finished]   # the searcher acted, so the reward is already ours
 
-        return [{a: (s / n, n) for a, (s, n) in t.items()} for t in totals]
+        alive = ~finished
+        while alive.any():
+            states, masks, players = batch.observe()
+            idx = np.flatnonzero(alive)
+            actions = np.zeros(n, dtype=np.int64)
+            actions[idx] = self._sample(states[idx], masks[idx])
+            actor[idx] = players[idx]
+            rewards, dones = batch.step(actions)
+            just_done = idx[dones[idx]]
+            sign = np.where(actor[just_done] == sim_agent[just_done], 1.0, -1.0)
+            outcome[just_done] = rewards[just_done] * sign
+            alive[just_done] = False
+
+        results = []
+        for i in range(len(envs)):
+            stats = {}
+            for a in candidates[i]:
+                sel = (sim_env == i) & (sim_action == int(a))
+                stats[int(a)] = (float(outcome[sel].mean()), int(sel.sum()))
+            results.append(stats)
+        return results
 
     def act_envs(self, envs):
         stats = self.evaluate_actions(envs)

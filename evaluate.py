@@ -80,66 +80,64 @@ class ModelPolicy:
         return actions.cpu().numpy()
 
 
-def play_matches(agent, opponent, num_games, seed=0):
+def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
     """Agent plays as player 1 in even-indexed games and player 2 in odd ones.
 
-    A game is a strict draw/discard alternation, so the player to act at step k
-    is 1 when (k // 2) is even and 2 otherwise. Terminal rewards are from the
-    acting player's perspective: >0 the actor won, <0 the actor lost, 0 a draw.
+    All games are stepped together in one threaded EnvBatch. Terminal rewards
+    are from the acting player's perspective: >0 the actor won, <0 the actor
+    lost, 0 a draw.
     """
-    envs = [rummy_engine.RummyEnv(seed + i) for i in range(num_games)]
-    for env in envs:
-        env.reset()
-    agent_player = np.where(np.arange(num_games) % 2 == 0, 1, 2)
-    step_idx = np.zeros(num_games, dtype=np.int64)
+    if num_threads <= 0:
+        num_threads = os.cpu_count() or 1
+    batch = rummy_engine.EnvBatch([rummy_engine.RummyEnv(seed + i) for i in range(num_games)], num_threads)
+    agent_player = np.where(np.arange(num_games) % 2 == 0, 1, 2).astype(np.int32)
     alive = np.ones(num_games, dtype=bool)
 
     wins = draws = 0
     agent_penalties = 0
     agent_draws = agent_deep_draws = agent_pile_available = 0
-    game_lengths = np.zeros(num_games, dtype=np.int64)
+    steps = np.zeros(num_games, dtype=np.int64)
     # Agent's score sampled before its final step: meld points, excluding the
     # opponent's leftover hand value that settle_terminal() adds at game end.
     meld_points = np.zeros(num_games, dtype=np.float64)
 
     while alive.any():
+        states, masks, players = batch.observe()
         live = np.flatnonzero(alive)
-        obs = np.stack([envs[i].get_state() for i in live])
-        mask = np.stack([envs[i].get_legal_actions() for i in live])
-        acting = np.where((step_idx[live] // 2) % 2 == 0, 1, 2)
-        agent_turn = acting == agent_player[live]
+        agent_turn = players[live] == agent_player[live]
+        agent_idx = live[agent_turn]
+        opp_idx = live[~agent_turn]
 
-        actions = np.empty(len(live), dtype=np.int64)
-        if agent_turn.any():
+        actions = np.zeros(num_games, dtype=np.int64)
+        if len(agent_idx):
             if getattr(agent, "needs_env", False):
-                actions[agent_turn] = agent.act_envs([envs[i] for i in live[agent_turn]])
+                actions[agent_idx] = agent.act_envs([batch.get(int(i)) for i in agent_idx])
             else:
-                actions[agent_turn] = agent.act(obs[agent_turn], mask[agent_turn])
-        if (~agent_turn).any():
-            actions[~agent_turn] = opponent.act(obs[~agent_turn], mask[~agent_turn])
+                actions[agent_idx] = agent.act(states[agent_idx], masks[agent_idx])
+        if len(opp_idx):
+            actions[opp_idx] = opponent.act(states[opp_idx], masks[opp_idx])
 
-        draw_phase = obs[:, -3] == 0.0
-        agent_draws += int((agent_turn & draw_phase).sum())
-        agent_deep_draws += int((agent_turn & draw_phase & (actions > 0)).sum())
-        agent_pile_available += int((agent_turn & draw_phase & mask[:, 1:].any(axis=1)).sum())
+        draw_phase = states[agent_idx, -3] == 0.0
+        agent_draws += int(draw_phase.sum())
+        agent_deep_draws += int((draw_phase & (actions[agent_idx] > 0)).sum())
+        agent_pile_available += int((draw_phase & masks[agent_idx, 1:].any(axis=1)).sum())
 
-        for j, i in enumerate(live):
-            meld_points[i] = envs[i].get_score(int(agent_player[i]))
-            reward, done = envs[i].step(int(actions[j]))
-            step_idx[i] += 1
-            if not done:
-                continue
-            alive[i] = False
-            game_lengths[i] = step_idx[i]
-            actor_is_agent = agent_turn[j]
-            if reward == 0:
-                draws += 1
-            elif (reward > 0) == actor_is_agent:
-                wins += 1
+        scores = batch.scores()
+        meld_points[live] = scores[live, agent_player[live] - 1]
+        rewards, dones = batch.step(actions)
+        steps[live] += 1
+
+        finished = live[dones[live]]
+        if len(finished):
+            actor_is_agent = players[finished] == agent_player[finished]
+            r = rewards[finished]
+            draws += int((r == 0).sum())
+            wins += int(((r != 0) & ((r > 0) == actor_is_agent)).sum())
             # A -50 with cards still in the deck is the meld-failure penalty; at deck
             # exhaustion -50 can also be a legitimate score difference.
-            if actor_is_agent and reward == -50 and envs[i].get_state()[-2] < 1.0:
-                agent_penalties += 1
+            end_states = batch.observe()[0]
+            agent_penalties += int((actor_is_agent & (r == -50) & (end_states[finished, -2] < 1.0)).sum())
+            alive[finished] = False
 
     return {
         "win_rate": wins / num_games,
@@ -148,7 +146,7 @@ def play_matches(agent, opponent, num_games, seed=0):
         "deep_draw_rate": agent_deep_draws / max(agent_draws, 1),
         "pile_take_rate": agent_deep_draws / max(agent_pile_available, 1),
         "meld_points": float(meld_points.mean()),
-        "mean_turns": float(game_lengths.mean()) / 2,
+        "mean_turns": float(steps.mean()) / 2,
     }
 
 

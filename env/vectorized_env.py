@@ -17,7 +17,7 @@ class VectorizedRummyEnv:
     without that information.
     """
 
-    def __init__(self, num_envs, num_threads=1, seed=None, blank_known_prob=0.0):
+    def __init__(self, num_envs, num_threads=0, seed=None, blank_known_prob=0.0):
         if seed is None:
             seed = int(np.random.randint(0, 2**31))
         if num_threads <= 0:
