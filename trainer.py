@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -169,12 +170,12 @@ class PPOTrainer:
         return total_a_loss / batches, total_c_loss / batches
 
     def save_checkpoint(self, path: str):
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         torch.save(self.model.state_dict(), path)
 
 if __name__ == "__main__":
-    import os
-    os.makedirs("checkpoints", exist_ok=True)
-    
     cfg = PPOConfig()
     trainer = PPOTrainer(cfg)
     trainer.train()
