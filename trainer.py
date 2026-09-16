@@ -61,7 +61,8 @@ class PPOTrainer:
         self.cfg = config
         self.device = torch.device(config.device)
         
-        self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads)
+        self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
+                                       blank_known_prob=config.blank_known_prob)
         self.model = RummyActorCritic(obs_dim=config.obs_dim, action_dim=config.action_dim).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
@@ -191,16 +192,20 @@ class PPOTrainer:
         vs_deck = play_matches(agent, DeckOnlyPolicy(global_step), n, seed=global_step + 1)
         vs_greedy = play_matches(agent, GreedyPolicy(global_step), n, seed=global_step + 3)
         greedy_score = vs_greedy["win_rate"] + 0.5 * vs_greedy["draw_rate"]
+        blind = ModelPolicy(self.model, self.device, blank_known=True)
+        vs_greedy_blind = play_matches(blind, GreedyPolicy(global_step), n, seed=global_step + 3)
+        blind_score = vs_greedy_blind["win_rate"] + 0.5 * vs_greedy_blind["draw_rate"]
         self.writer.add_scalar("Eval/WinRate_vs_Random", vs_random["win_rate"], global_step)
         self.writer.add_scalar("Eval/WinRate_vs_DeckOnly", vs_deck["win_rate"], global_step)
         self.writer.add_scalar("Eval/Score_vs_Greedy", greedy_score, global_step)
+        self.writer.add_scalar("Eval/Score_vs_Greedy_Blind", blind_score, global_step)
         self.writer.add_scalar("Eval/PenaltyRate", vs_greedy["penalty_rate"], global_step)
         self.writer.add_scalar("Eval/DeepDrawRate", vs_greedy["deep_draw_rate"], global_step)
         self.writer.add_scalar("Eval/PileTakeRate", vs_greedy["pile_take_rate"], global_step)
         self.writer.add_scalar("Eval/MeldPoints", vs_greedy["meld_points"], global_step)
         self.writer.add_scalar("Eval/MeanTurns", vs_greedy["mean_turns"], global_step)
         line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | vs deck-only {vs_deck['win_rate']:.1%} | "
-                f"vs greedy {greedy_score:.1%} | pile-take {vs_greedy['pile_take_rate']:.1%} | "
+                f"vs greedy {greedy_score:.1%} (blind {blind_score:.1%}) | pile-take {vs_greedy['pile_take_rate']:.1%} | "
                 f"meld pts {vs_greedy['meld_points']:.1f} | {vs_greedy['mean_turns']:.1f} turns")
 
         # Win rate against a snapshot of this policy from frozen_refresh evals ago;

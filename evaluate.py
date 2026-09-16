@@ -7,6 +7,7 @@ import torch
 
 import rummy_engine
 from config import PPOConfig
+from env.vectorized_env import KNOWN_CARDS
 from models.ppo_network import RummyActorCritic
 
 
@@ -59,13 +60,17 @@ class GreedyPolicy:
 
 
 class ModelPolicy:
-    def __init__(self, model, device, greedy=False):
+    def __init__(self, model, device, greedy=False, blank_known=False):
         self.model = model
         self.device = device
         self.greedy = greedy
+        self.blank_known = blank_known
 
     @torch.no_grad()
     def act(self, obs, mask):
+        if self.blank_known:
+            obs = obs.copy()
+            obs[:, KNOWN_CARDS] = 0.0
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
         logits, _ = self.model(obs_t, mask_t)
@@ -172,17 +177,21 @@ def main():
 
     print(f"baseline: {os.path.basename(args.checkpoints[0])}   "
           f"(scores count a draw as half a win; pile-take, meld pts and turns are from games vs greedy)")
-    print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs greedy':>9} {'vs base':>8} "
+    print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs greedy':>9} {'(blind)':>8} {'vs base':>8} "
           f"{'penalty':>8} {'pile-take':>10} {'meld pts':>9} {'turns':>6}")
     for path in args.checkpoints:
-        agent = ModelPolicy(load_model(path, device), device, args.greedy)
+        model = load_model(path, device)
+        agent = ModelPolicy(model, device, args.greedy)
+        blind = ModelPolicy(model, device, args.greedy, blank_known=True)
         vs_random = play_matches(agent, random_policy, args.games, args.seed)
         vs_deck = play_matches(agent, deck_only, args.games, args.seed + 1)
         vs_greedy = play_matches(agent, greedy, args.games, args.seed + 2)
+        vs_greedy_blind = play_matches(blind, greedy, args.games, args.seed + 2)
         vs_base = play_matches(agent, baseline, args.games, args.seed + 3)
         print(f"{os.path.basename(path):<28} {score(vs_random):>9.1%} {score(vs_deck):>8.1%} "
-              f"{score(vs_greedy):>9.1%} {score(vs_base):>8.1%} {vs_greedy['penalty_rate']:>8.1%} "
-              f"{vs_greedy['pile_take_rate']:>10.1%} {vs_greedy['meld_points']:>9.1f} {vs_greedy['mean_turns']:>6.1f}")
+              f"{score(vs_greedy):>9.1%} {score(vs_greedy_blind):>8.1%} {score(vs_base):>8.1%} "
+              f"{vs_greedy['penalty_rate']:>8.1%} {vs_greedy['pile_take_rate']:>10.1%} "
+              f"{vs_greedy['meld_points']:>9.1f} {vs_greedy['mean_turns']:>6.1f}")
 
 
 if __name__ == "__main__":
