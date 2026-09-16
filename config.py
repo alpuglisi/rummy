@@ -3,8 +3,9 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     # Environment Setup
-    num_envs: int = 16
-    num_steps: int = 2048      # Steps per environment before an update
+    num_envs: int = 64
+    num_steps: int = 512       # Steps per environment before an update
+    env_threads: int = 1       # C++ threads for stepping envs; >1 only pays off with hundreds of envs
     obs_dim: int = 159
     action_dim: int = 105
     

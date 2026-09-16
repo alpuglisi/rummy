@@ -6,7 +6,8 @@ ext_modules = [
         "rummy_engine",
         ["rummy_env.cpp"],
         cxx_std=17,
-        extra_compile_args=["-O3", "-ffast-math", "-march=native"]
+        extra_compile_args=["-O3", "-ffast-math", "-march=native", "-pthread"],
+        extra_link_args=["-pthread"],
     ),
 ]
 

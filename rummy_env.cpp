@@ -245,8 +245,13 @@ float RummyEnv::settle_terminal(int winner) {
 }
 
 py::tuple RummyEnv::step(int action) {
+    auto result = step_raw(action);
+    return py::make_tuple(result.first, result.second);
+}
+
+std::pair<float, bool> RummyEnv::step_raw(int action) {
     if (state.is_terminal) {
-        return py::make_tuple(0.0f, true);
+        return {0.0f, true};
     }
 
     if (action < 0 || action >= ACTION_SPACE_SIZE) {
@@ -275,7 +280,7 @@ py::tuple RummyEnv::step(int action) {
         }
         state.turn_phase_is_discard = true;
         update_observation_buffer();
-        return py::make_tuple(0.0f, false);
+        return {0.0f, false};
     } else {
         // --- DISCARD PHASE ---
         int discard_card = action - 53;
@@ -288,7 +293,7 @@ py::tuple RummyEnv::step(int action) {
             if (!melded) {
                 state.is_terminal = true;
                 update_observation_buffer();
-                return py::make_tuple(-50.0f, true);
+                return {-50.0f, true};
             }
         }
 
@@ -304,21 +309,21 @@ py::tuple RummyEnv::step(int action) {
         if (get_hand(acting_player).empty()) {
             float reward = settle_terminal(acting_player);
             update_observation_buffer();
-            return py::make_tuple(reward, true);
+            return {reward, true};
         }
 
         // Check if the deck is empty after the turn finishes
         if (deck_index >= DECK_SIZE) {
             float reward = settle_terminal(-1);
             update_observation_buffer();
-            return py::make_tuple(reward, true);
+            return {reward, true};
         }
 
         state.turn_phase_is_discard = false;
         state.current_player = (acting_player == 1) ? 2 : 1;
 
         update_observation_buffer();
-        return py::make_tuple(0.1f, false);
+        return {0.1f, false};
     }
 }
 
@@ -335,6 +340,67 @@ py::array_t<float> RummyEnv::get_state() const {
     return py::array_t<float>(observation_buffer.size(), observation_buffer.data());
 }
 
+// --- Vectorized Environment ---
+
+VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads)
+    : num_threads(std::max(1, num_threads)) {
+    if (num_envs <= 0) throw std::invalid_argument("num_envs must be positive");
+    envs.reserve(num_envs);
+    for (int i = 0; i < num_envs; i++) envs.emplace_back(seed + static_cast<uint32_t>(i));
+}
+
+void VectorizedRummyEnv::write_obs(int i, float* states, bool* masks) {
+    const std::vector<float>& obs = envs[i].observation();
+    std::copy(obs.begin(), obs.end(), states + static_cast<size_t>(i) * OBS_SPACE_SIZE);
+    std::vector<uint8_t> mask = envs[i].legal_mask();
+    bool* row = masks + static_cast<size_t>(i) * ACTION_SPACE_SIZE;
+    for (int a = 0; a < ACTION_SPACE_SIZE; a++) row[a] = mask[a] != 0;
+}
+
+py::tuple VectorizedRummyEnv::reset() {
+    const int n = size();
+    py::array_t<float> states({n, OBS_SPACE_SIZE});
+    py::array_t<bool> masks({n, ACTION_SPACE_SIZE});
+    float* s = states.mutable_data();
+    bool* m = masks.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for_each_env([&](int i) {
+            envs[i].reset();
+            write_obs(i, s, m);
+        });
+    }
+    return py::make_tuple(states, masks);
+}
+
+py::tuple VectorizedRummyEnv::step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions) {
+    const int n = size();
+    if (actions.ndim() != 1 || actions.shape(0) != n) {
+        throw std::invalid_argument("actions must be a 1-D array with one entry per environment");
+    }
+    const int64_t* a = actions.data();
+
+    py::array_t<float> states({n, OBS_SPACE_SIZE});
+    py::array_t<bool> masks({n, ACTION_SPACE_SIZE});
+    py::array_t<float> rewards(n);
+    py::array_t<bool> dones(n);
+    float* s = states.mutable_data();
+    bool* m = masks.mutable_data();
+    float* r = rewards.mutable_data();
+    bool* d = dones.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for_each_env([&](int i) {
+            auto result = envs[i].step_raw(static_cast<int>(a[i]));
+            if (result.second) envs[i].reset();
+            r[i] = result.first;
+            d[i] = result.second;
+            write_obs(i, s, m);
+        });
+    }
+    return py::make_tuple(states, masks, rewards, dones);
+}
+
 // --- Pybind11 Module Definition ---
 PYBIND11_MODULE(rummy_engine, m) {
     py::class_<RummyEnv>(m, "RummyEnv")
@@ -345,4 +411,11 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_score", &RummyEnv::get_score)
         .def("get_legal_actions", &RummyEnv::get_legal_actions)
         .def("get_state", &RummyEnv::get_state);
+
+    py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
+        .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)
+        .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
+        .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,159] float32, masks[N,105] bool).")
+        .def("step", &VectorizedRummyEnv::step,
+             "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");
 }
