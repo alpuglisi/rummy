@@ -2,7 +2,6 @@ import os
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from env.vectorized_env import VectorizedRummyEnv
@@ -129,21 +128,25 @@ class PPOTrainer:
 
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        dataset = TensorDataset(b_states, b_masks, b_actions, b_logprobs, b_advantages, b_returns)
-        loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=True)
-
+        num_samples = b_states.shape[0]
         total_a_loss = 0
         total_c_loss = 0
         batches = 0
 
         for _ in range(self.cfg.epochs):
-            for batch in loader:
-                mb_states, mb_masks, mb_actions, mb_old_logprobs, mb_advantages, mb_returns = batch
-                
+            perm = torch.randperm(num_samples, device=self.device)
+            for start in range(0, num_samples, self.cfg.batch_size):
+                idx = perm[start:start + self.cfg.batch_size]
+                mb_states = b_states[idx]
+                mb_masks = b_masks[idx]
+                mb_actions = b_actions[idx]
+                mb_old_logprobs = b_logprobs[idx]
+                mb_advantages = b_advantages[idx]
+                mb_returns = b_returns[idx]
+
                 logits, new_values = self.model(mb_states, mb_masks)
-                probs = F.softmax(logits, dim=-1)
-                dist = torch.distributions.Categorical(probs)
-                
+                dist = torch.distributions.Categorical(logits=logits)
+
                 new_logprobs = dist.log_prob(mb_actions)
                 entropy = dist.entropy().mean()
 

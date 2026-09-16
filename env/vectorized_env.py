@@ -45,8 +45,8 @@ class VectorizedRummyEnv:
         return torch.tensor(np.stack(states), dtype=torch.float32),                torch.tensor(np.stack(masks), dtype=torch.bool)
 
     def step(self, actions):
-        for remote, action in zip(self.remotes, actions):
-            remote.send(('step', action.item()))
+        for remote, action in zip(self.remotes, actions.tolist()):
+            remote.send(('step', action))
             
         results = [remote.recv() for remote in self.remotes]
         states, masks, rewards, dones = zip(*results)

@@ -101,6 +101,7 @@ RummyEnv::RummyEnv(uint32_t seed) : rng(seed), deck_index(0) {
     deck_order.resize(DECK_SIZE);
     for (int i = 0; i < DECK_SIZE; i++) deck_order[i] = i;
     observation_buffer.resize(OBS_SPACE_SIZE, 0.0f);
+    reset();
 }
 
 void RummyEnv::deal_initial_hands() {

@@ -28,15 +28,12 @@ class RummyActorCritic(nn.Module):
         logits = self.actor_logits(a)
         
         if action_mask is not None:
-            # Masking FP16 underflow fix
-            huge_negative = torch.tensor(torch.finfo(logits.dtype).min, device=logits.device)
-            logits = torch.where(action_mask, logits, huge_negative)
-            
+            logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
+
         return logits, value
 
     def get_action(self, state, action_mask):
         logits, value = self.forward(state, action_mask)
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
+        dist = Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), value

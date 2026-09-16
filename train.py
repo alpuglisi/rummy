@@ -19,6 +19,7 @@ def main():
     finally:
         trainer.save_checkpoint("rummy_agent_checkpoint.pth")
         print("Checkpoint saved. Shutting down environments.")
+        trainer.writer.close()
         trainer.envs.close()
 
 if __name__ == "__main__":
