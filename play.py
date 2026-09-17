@@ -30,7 +30,9 @@ starts a new game, Q quits.
 """
 import argparse
 import os
+import random
 import sys
+import time
 
 import numpy as np
 import pygame
@@ -89,6 +91,10 @@ class Game:
         self.selected = set()
         self.log = []
         self.result = None
+        # The computer's moves are played from the main loop once this time has
+        # passed: a 2-6 s pause before its turn so it appears to think, then a
+        # short one between its draw and its discard so both can be followed.
+        self.computer_due = None
         self.env.set_manual_meld(self.human)
         self.new_game()
 
@@ -100,6 +106,7 @@ class Game:
         self.result = None
         self.advice = {}
         self.selected.clear()
+        self.computer_due = None
         self.refresh_advice()
 
     def obs(self):
@@ -262,13 +269,33 @@ class Game:
         self.selected.clear()
         self.apply(53 + card, "You")
 
+    def computer_to_move(self):
+        return not self.env.is_done() and self.env.get_current_player() == self.computer_seat()
+
+    def computer_step(self):
+        """Play one computer action (a draw or a discard)."""
+        if hasattr(self.computer, "act_envs"):
+            action = int(self.computer.act_envs([self.env])[0])
+        else:
+            action = int(self.computer.act(self.obs()[None], self.legal()[None])[0])
+        self.apply(action, "Computer")
+
     def computer_turn(self):
-        while not self.env.is_done() and self.env.get_current_player() == self.computer_seat():
-            if hasattr(self.computer, "act_envs"):
-                action = int(self.computer.act_envs([self.env])[0])
-            else:
-                action = int(self.computer.act(self.obs()[None], self.legal()[None])[0])
-            self.apply(action, "Computer")
+        """Play the computer's whole turn at once (no pauses; used by tests)."""
+        while self.computer_to_move():
+            self.computer_step()
+
+    def tick_computer(self, now):
+        """Called every frame: schedule and play the computer's moves with pauses."""
+        if not self.computer_to_move():
+            self.computer_due = None
+            return
+        if self.computer_due is None:
+            drawing = not self.phase_is_discard()
+            self.computer_due = now + (random.uniform(2.0, 6.0) if drawing else random.uniform(0.6, 1.4))
+        elif now >= self.computer_due:
+            self.computer_step()
+            self.computer_due = None
 
     def computer_seat(self):
         return 2 if self.human == 1 else 1
@@ -488,8 +515,6 @@ def main():
                     game.meld_selected()
                 elif event.key == pygame.K_d:
                     game.discard_selected()
-                    view.draw(game)
-                    game.computer_turn()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 hit = view.click(event.pos)
                 if hit is not None:
@@ -504,8 +529,7 @@ def main():
                         game.lay_off_selected(value)
                     elif kind == "discard":
                         game.discard_selected()
-                        view.draw(game)
-                        game.computer_turn()
+        game.tick_computer(time.time())
         view.draw(game)
         clock.tick(30)
     pygame.quit()
