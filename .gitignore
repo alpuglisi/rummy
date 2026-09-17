@@ -7,3 +7,4 @@ build/
 *.pth
 runs/
 checkpoints/
+.claude/worktrees/
