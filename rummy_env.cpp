@@ -55,6 +55,99 @@ Meld RummyEnv::find_largest_meld_with_card(const std::vector<int>& hand, int car
     return best;
 }
 
+bool RummyEnv::can_take_pile(int player, size_t index) const {
+    const int card = state.discard_pile[index];
+    std::vector<int> combined = get_hand(player);
+    combined.insert(combined.end(), state.discard_pile.begin() + index, state.discard_pile.end());
+    Meld m = find_largest_meld_with_card(combined, card);
+    // A fresh meld needs a 4th card left in hand (a larger meld is trimmed to
+    // leave a discard, see the discard phase); otherwise the card may extend
+    // a meld already on the table.
+    return (!m.empty() && combined.size() >= 4) || (find_lay_off(card) >= 0 && combined.size() > 1);
+}
+
+int RummyEnv::immediate_points(const std::vector<int>& hand, int card) const {
+    std::vector<int> combined(hand);
+    combined.push_back(card);
+    Meld m = find_largest_meld_with_card(combined, card);
+    if (!m.empty() && combined.size() >= 4) {
+        int pts = 0;
+        for (int c : m) pts += get_point_value(c);
+        return pts;
+    }
+    if (find_lay_off(card) >= 0 && combined.size() > 1) return get_point_value(card);
+    return 0;
+}
+
+bool RummyEnv::could_go_out(int player, const std::vector<int>& extra) const {
+    RummyEnv sim(*this);
+    for (int c : extra) sim.state.card_locations[c] = static_cast<int8_t>(player);
+    sim.auto_meld(player);
+    return sim.get_hand(player).size() <= 1;
+}
+
+std::vector<std::array<int, 4>> RummyEnv::get_history() const {
+    std::vector<std::array<int, 4>> out;
+    out.reserve(state.history.size());
+    for (const Event& e : state.history) out.push_back({e.player, e.kind, e.card, e.count});
+    return out;
+}
+
+void RummyEnv::aux_targets(float* out) const {
+    std::fill(out, out + AUX_SPACE_SIZE, 0.0f);
+    const int me = state.current_player;
+    const int opp = (me == 1) ? 2 : 1;
+    const std::vector<int> my_hand = get_hand(me);
+    const std::vector<int> opp_hand = get_hand(opp);
+    float* opp_cards = out;
+    float* layoff_targets = out + DECK_SIZE;
+    float* takeable = out + 2 * DECK_SIZE;
+    float* discard_value = out + 3 * DECK_SIZE;
+    float* scalars = out + 4 * DECK_SIZE;
+
+    for (int c : opp_hand) opp_cards[c] = 1.0f;
+    for (const Meld& m : state.table) {
+        bool extendable = false;
+        for (int c : opp_hand) if (can_lay_off(c, m)) { extendable = true; break; }
+        if (extendable) for (int c : m) layoff_targets[c] = 1.0f;
+    }
+    for (int c : my_hand) {
+        const int pts = immediate_points(opp_hand, c);
+        if (pts > 0) {
+            takeable[c] = 1.0f;
+            discard_value[c] = std::min(1.0f, static_cast<float>(pts) / 50.0f);
+        }
+    }
+    scalars[0] = find_all_possible_melds(opp_hand).empty() ? 0.0f : 1.0f;
+    int opp_points = 0;
+    for (int c : opp_hand) opp_points += get_point_value(c);
+    scalars[1] = static_cast<float>(opp_points) / 100.0f;
+
+    // Can the opponent go out on their next turn? Try the deck's next card
+    // and every pile take that would be legal for them.
+    bool go_out = false;
+    if (deck_index < DECK_SIZE) go_out = could_go_out(opp, {deck_order[deck_index]});
+    for (size_t i = 0; i < state.discard_pile.size() && !go_out; i++) {
+        if (can_take_pile(opp, i)) {
+            std::vector<int> taken(state.discard_pile.begin() + i, state.discard_pile.end());
+            go_out = could_go_out(opp, taken);
+        }
+    }
+    scalars[2] = go_out ? 1.0f : 0.0f;
+
+    // Would one of the next three deck cards complete a meld or lay-off for me?
+    for (int k = 0; k < 3 && deck_index + k < DECK_SIZE; k++) {
+        const int d = deck_order[deck_index + k];
+        if (immediate_points(my_hand, d) > 0) { scalars[3] = 1.0f; break; }
+    }
+}
+
+py::array_t<float> RummyEnv::get_aux_targets() const {
+    py::array_t<float> out(AUX_SPACE_SIZE);
+    aux_targets(out.mutable_data());
+    return out;
+}
+
 std::vector<int> RummyEnv::get_hand(int player) const {
     std::vector<int> hand;
     for (int i = 0; i < DECK_SIZE; i++) {
@@ -149,8 +242,9 @@ bool RummyEnv::can_lay_off(int card, const Meld& meld) const {
 
 // --- Environment Logic ---
 
-RummyEnv::RummyEnv(uint32_t seed, int target_score, int max_rounds)
-    : rng(seed), deck_index(0), target_score(target_score), max_rounds(max_rounds) {
+RummyEnv::RummyEnv(uint32_t seed, int target_score, int max_rounds, int hand_size)
+    : rng(seed), deck_index(0), target_score(target_score), max_rounds(max_rounds), hand_size(hand_size) {
+    if (hand_size < 1 || 2 * hand_size + 1 > DECK_SIZE) throw std::invalid_argument("hand_size out of range");
     deck_order.resize(DECK_SIZE);
     for (int i = 0; i < DECK_SIZE; i++) deck_order[i] = i;
     observation_buffer.resize(OBS_SPACE_SIZE, 0.0f);
@@ -158,7 +252,7 @@ RummyEnv::RummyEnv(uint32_t seed, int target_score, int max_rounds)
 }
 
 void RummyEnv::deal_initial_hands() {
-    for (int i = 0; i < HAND_SIZE; i++) {
+    for (int i = 0; i < hand_size; i++) {
         state.card_locations[deck_order[deck_index++]] = 1;
         state.card_locations[deck_order[deck_index++]] = 2;
     }
@@ -171,6 +265,7 @@ void RummyEnv::reset() {
     state.p2_score = 0.0f;
     state.round_number = 1;
     state.penalised_player = 0;
+    state.last_round_out = 0;
     start_round();
     state.round_just_ended = false;
     update_observation_buffer();
@@ -183,6 +278,7 @@ void RummyEnv::start_round() {
     state.card_locations.fill(0);
     state.discard_pile.clear();
     state.table.clear();
+    state.history.clear();
     state.publicly_known.fill(0);
     state.required_meld_card = -1;
     state.turn_phase_is_discard = false;
@@ -198,6 +294,7 @@ void RummyEnv::start_round() {
 }
 
 float RummyEnv::end_round(int acting_player) {
+    state.last_round_out = get_hand(acting_player).empty() ? acting_player : 0;
     int hand_value[3] = {0, 0, 0};
     for (int i = 0; i < DECK_SIZE; i++) {
         const int loc = state.card_locations[i];
@@ -260,6 +357,19 @@ void RummyEnv::update_observation_buffer() {
         if (state.card_locations[i] == state.current_player) own_hand_size++;
     }
 
+    // Turn history: the last HISTORY_LEN events, most recent in the last slot.
+    const int base = DECK_SIZE * 6;
+    const int n_events = static_cast<int>(state.history.size());
+    const int first = std::max(0, n_events - HISTORY_LEN);
+    for (int e = first; e < n_events; e++) {
+        const Event& ev = state.history[e];
+        float* slot = &observation_buffer[base + (HISTORY_LEN - (n_events - e)) * EVENT_DIM];
+        slot[0] = (ev.player != state.current_player) ? 1.0f : 0.0f;
+        slot[1 + ev.kind] = 1.0f;
+        if (ev.card >= 0) slot[4 + ev.card] = 1.0f;
+        slot[4 + DECK_SIZE] = static_cast<float>(ev.count) / 10.0f;
+    }
+
     const float own_score = (state.current_player == 1) ? state.p1_score : state.p2_score;
     const float opp_score = (state.current_player == 1) ? state.p2_score : state.p1_score;
     observation_buffer[OBS_SPACE_SIZE - 8] = own_score / static_cast<float>(target_score);
@@ -285,19 +395,8 @@ std::vector<uint8_t> RummyEnv::compute_legal_mask() {
         // immediately: melded with the hand plus everything above it in the
         // pile, or laid off onto a meld already on the table. Either way a
         // card must remain to discard, since going out requires a discard.
-        std::vector<int> hand = get_hand(state.current_player);
         for (size_t i = 0; i < state.discard_pile.size(); i++) {
-            const int card = state.discard_pile[i];
-            std::vector<int> combined(hand);
-            combined.insert(combined.end(), state.discard_pile.begin() + i, state.discard_pile.end());
-            Meld m = find_largest_meld_with_card(combined, card);
-            // A fresh meld needs a 4th card left in hand (a larger meld is
-            // trimmed to leave a discard, see the discard phase below);
-            // otherwise the card may extend a meld already on the table.
-            if ((!m.empty() && combined.size() >= 4) ||
-                (find_lay_off(card) >= 0 && combined.size() > 1)) {
-                mask[1 + i] = 1;
-            }
+            if (can_take_pile(state.current_player, i)) mask[1 + i] = 1;
         }
     } else {
         // Discard Actions
@@ -406,9 +505,13 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
             int drawn = deck_order[deck_index++];
             state.card_locations[drawn] = acting_player;
             state.required_meld_card = -1;
+            state.history.push_back({static_cast<int8_t>(acting_player), 0, -1, 1});
         } else {
             int pile_index = action - 1;
             state.required_meld_card = state.discard_pile[pile_index];
+            state.history.push_back({static_cast<int8_t>(acting_player), 1,
+                                     static_cast<int8_t>(state.discard_pile[pile_index]),
+                                     static_cast<int8_t>(state.discard_pile.size() - pile_index)});
 
             for (size_t i = pile_index; i < state.discard_pile.size(); i++) {
                 state.card_locations[state.discard_pile[i]] = acting_player;
@@ -441,6 +544,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         state.publicly_known[discard_card] = 0;
         state.discard_pile.push_back(discard_card);
         state.required_meld_card = -1;
+        state.history.push_back({static_cast<int8_t>(acting_player), 2, static_cast<int8_t>(discard_card), 1});
 
         // 3. Auto-meld remaining valid sets/runs to score points naturally
         if (acting_player != manual_meld_player) auto_meld(acting_player);
@@ -707,11 +811,27 @@ void write_observation(const RummyEnv& env, int i, float* states, bool* masks) {
 
 // --- Vectorized Environment ---
 
-VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads) {
+VectorizedRummyEnv::VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads, int target_score,
+                                       int hand_size) {
     if (num_envs <= 0) throw std::invalid_argument("num_envs must be positive");
     envs.reserve(num_envs);
-    for (int i = 0; i < num_envs; i++) envs.emplace_back(seed + static_cast<uint32_t>(i));
+    for (int i = 0; i < num_envs; i++) {
+        envs.emplace_back(seed + static_cast<uint32_t>(i), target_score, DEFAULT_MAX_ROUNDS, hand_size);
+    }
     pool = make_pool(num_threads, num_envs);
+}
+
+py::array_t<float> VectorizedRummyEnv::aux_targets() {
+    const int n = size();
+    py::array_t<float> out({n, AUX_SPACE_SIZE});
+    float* o = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        parallel_for(pool.get(), n, [&](int i) {
+            envs[i].aux_targets(o + static_cast<size_t>(i) * AUX_SPACE_SIZE);
+        });
+    }
+    return out;
 }
 
 py::array_t<int32_t> VectorizedRummyEnv::current_players() const {
@@ -755,21 +875,27 @@ py::tuple VectorizedRummyEnv::step(py::array_t<int64_t, py::array::c_style | py:
     py::array_t<bool> masks({n, ACTION_SPACE_SIZE});
     py::array_t<float> rewards(n);
     py::array_t<bool> dones(n);
+    py::array_t<bool> round_ends(n);
+    py::array_t<int32_t> round_outs(n);
     float* s = states.mutable_data();
     bool* m = masks.mutable_data();
     float* r = rewards.mutable_data();
     bool* d = dones.mutable_data();
+    bool* e = round_ends.mutable_data();
+    int32_t* w = round_outs.mutable_data();
     {
         py::gil_scoped_release release;
         parallel_for(pool.get(), n, [&](int i) {
             auto result = envs[i].step_raw(static_cast<int>(a[i]));
+            e[i] = envs[i].round_ended();
+            w[i] = e[i] ? envs[i].get_last_round_out() : 0;
             if (result.second) envs[i].reset();
             r[i] = result.first;
             d[i] = result.second;
             write_observation(envs[i], i, s, m);
         });
     }
-    return py::make_tuple(states, masks, rewards, dones);
+    return py::make_tuple(states, masks, rewards, dones, round_ends, round_outs);
 }
 
 // --- Env Batch ---
@@ -963,9 +1089,14 @@ void EnvBatch::randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_styl
 
 // --- Pybind11 Module Definition ---
 PYBIND11_MODULE(rummy_engine, m) {
+    m.attr("OBS_SPACE_SIZE") = OBS_SPACE_SIZE;
+    m.attr("AUX_SPACE_SIZE") = AUX_SPACE_SIZE;
+    m.attr("HISTORY_LEN") = HISTORY_LEN;
+    m.attr("EVENT_DIM") = EVENT_DIM;
+
     py::class_<RummyEnv>(m, "RummyEnv")
-        .def(py::init<uint32_t, int, int>(), py::arg("seed"), py::arg("target_score") = DEFAULT_TARGET_SCORE,
-             py::arg("max_rounds") = DEFAULT_MAX_ROUNDS)
+        .def(py::init<uint32_t, int, int, int>(), py::arg("seed"), py::arg("target_score") = DEFAULT_TARGET_SCORE,
+             py::arg("max_rounds") = DEFAULT_MAX_ROUNDS, py::arg("hand_size") = DEFAULT_HAND_SIZE)
         .def("reset", &RummyEnv::reset)
         .def("step", &RummyEnv::step,
              "Returns (reward, done). done is true only when the game ends (a player reached the target score).")
@@ -982,6 +1113,11 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get_state", &RummyEnv::get_state)
         .def("get_current_player", &RummyEnv::get_current_player)
         .def("get_opponent_hand", &RummyEnv::get_opponent_hand)
+        .def("get_aux_targets", &RummyEnv::get_aux_targets,
+             "Ground-truth auxiliary targets for the player to move (training only).")
+        .def("get_history", &RummyEnv::get_history, "This round's (player, kind, card, count) events, oldest first.")
+        .def("get_last_round_out", &RummyEnv::get_last_round_out)
+        .def("get_hand_size", &RummyEnv::get_hand_size)
         .def("randomize_hidden", &RummyEnv::randomize_hidden, py::arg("seed"))
         .def("randomize_hidden_weighted", &RummyEnv::randomize_hidden_weighted_py, py::arg("seed"), py::arg("weights"))
         .def("set_manual_meld", &RummyEnv::set_manual_meld, py::arg("player"),
@@ -996,7 +1132,11 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("clone", [](const RummyEnv& env) { return RummyEnv(env); });
 
     py::class_<VectorizedRummyEnv>(m, "VectorizedRummyEnv")
-        .def(py::init<int, uint32_t, int>(), py::arg("num_envs"), py::arg("seed"), py::arg("num_threads") = 1)
+        .def(py::init<int, uint32_t, int, int, int>(), py::arg("num_envs"), py::arg("seed"),
+             py::arg("num_threads") = 1, py::arg("target_score") = DEFAULT_TARGET_SCORE,
+             py::arg("hand_size") = DEFAULT_HAND_SIZE)
+        .def("aux_targets", &VectorizedRummyEnv::aux_targets,
+             "[N,AUX] float32 auxiliary targets for the player to move (training only).")
         .def_property_readonly("num_envs", &VectorizedRummyEnv::size)
         .def("get", &VectorizedRummyEnv::get, "Copy of live game i.")
         .def("current_players", &VectorizedRummyEnv::current_players, "Player to move in each game (1 or 2).")
@@ -1004,7 +1144,8 @@ PYBIND11_MODULE(rummy_engine, m) {
              "[N,52] bool: cards held by the player not to move (training target, not observable).")
         .def("reset", &VectorizedRummyEnv::reset, "Returns (states[N,obs], masks[N,105] bool).")
         .def("step", &VectorizedRummyEnv::step,
-             "Returns (states, masks, rewards[N] float32, dones[N] bool); finished games are auto-reset.");
+             "Returns (states, masks, rewards[N] float32, dones[N] bool, round_ends[N] bool, "
+             "round_outs[N] int32: player who went out, 0 otherwise); finished games are auto-reset.");
 
     py::class_<EnvBatch>(m, "EnvBatch")
         .def(py::init<const std::vector<RummyEnv>&, int>(), py::arg("envs"), py::arg("num_threads") = 1)

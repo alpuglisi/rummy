@@ -312,7 +312,8 @@ class View:
         """Ranked, plain-language list of the advisor's suggestions (top right)."""
         x, y = 700, 40
         rows = game.advice_rows()
-        self.text("Advisor: expected lead over the computer at the end of this round", x, y, self.small, DIM)
+        self.text("Advisor: expected points advantage (this round, plus the value of the position after it)",
+                  x, y, self.small, DIM)
         y += 20
         if not rows:
             self.text("thinking..." if game.show_advice else "", x, y, self.small, DIM)

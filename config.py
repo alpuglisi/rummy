@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class PPOConfig:
@@ -7,7 +7,8 @@ class PPOConfig:
     num_steps: int = 128       # Steps per environment before an update (131,072 samples)
     env_threads: int = 0       # C++ threads for stepping envs; 0 = one per CPU core
     blank_known_prob: float = 0.5  # Fraction of games that hide the opponent-known-cards channel
-    obs_dim: int = 320         # Must match OBS_SPACE_SIZE in rummy_env.h
+    obs_dim: int = 1004        # Must match OBS_SPACE_SIZE in rummy_env.h (6 channels + turn history + 8 scalars)
+    hand_size: int = 7         # Cards dealt per player; a curriculum knob (the engine supports 1..25)
     action_dim: int = 105
     
     # Network
@@ -28,6 +29,11 @@ class PPOConfig:
     pool_size: int = 8               # Snapshots kept (oldest dropped)
     pool_add_every: int = 50         # Updates between snapshots of the live policy (~6.5M steps)
     pool_init_dir: str = "archive"   # Checkpoints loaded into the pool at start, if the directory exists
+    # Prioritised fictitious self-play: pool members are sampled in proportion
+    # to (1 - learner's win rate against them) ** pool_pfsp_power, so the
+    # opponents that beat the learner are seen most. False samples uniformly.
+    pool_pfsp: bool = True
+    pool_pfsp_power: float = 2.0
     epochs: int = 4
     batch_size: int = 4096     # 32 minibatches per epoch at 1024 envs x 128 steps
     
@@ -54,18 +60,30 @@ class PPOConfig:
     best_margin: float = 0.02
     search_worlds: int = 16
     search_actions: int = 4
+    # Rollouts stop at the round's end (horizon 0) or after `horizon` engine
+    # steps, and with search_endgame the critic's value of the position at
+    # that point is added, so the search sees beyond the round and plays the
+    # score-to-500 endgame rather than the round margin alone.
+    search_horizon: int = 0
+    search_endgame: bool = True
 
     # Expert iteration: every distill_every updates, run the search on live
     # training positions (rollouts always play to the end of the game) and pull
     # the policy toward the search's action distribution.
     distill_every: int = 4
     distill_positions: int = 256
-    distill_worlds: int = 64       # ~+-7 pts per candidate outcome against a 15-pt temperature; 128 was half the run's wall clock
+    distill_worlds: int = 96       # More worlds, shorter rollouts: the critic values the position at the horizon
+    distill_horizon: int = 16      # Engine steps (8 turns) per teacher rollout; 0 = play the round out
     distill_actions: int = 6
     distill_coef: float = 0.5        # Weight of the distillation loss next to the PPO loss; 0 disables
     distill_belief: bool = True      # Deal search worlds from the opponent-hand head once it is useful...
     distill_belief_min_gain: float = 0.10  # ...i.e. once Aux/TopKPrecision exceeds the random baseline by this much
-    aux_coef: float = 0.5            # Weight of the opponent-hand prediction loss; 0 disables
+    aux_coef: float = 0.5            # Overall weight of the auxiliary losses; 0 disables them all
+    # Per-target weights inside the auxiliary loss (see trainer.aux_losses).
+    aux_weights: dict = field(default_factory=lambda: {
+        "opponent": 1.0, "next_discard": 0.5, "layoff": 0.5, "takeable": 0.5, "discard_value": 0.5,
+        "flags": 0.5, "hand_points": 0.5, "turns_left": 0.5, "goes_out": 0.5,
+    })
     distill_temperature: float = 15.0  # Points; softmax over candidate outcomes / temperature
 
     # System

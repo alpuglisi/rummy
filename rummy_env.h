@@ -22,21 +22,43 @@
 namespace py = pybind11;
 
 const int DECK_SIZE = 52;
-const int HAND_SIZE = 7;
+const int DEFAULT_HAND_SIZE = 7;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
+// Turn history in the observation: the last HISTORY_LEN draw/discard events
+// of the round, oldest first, each encoded as [by opponent, kind one-hot
+// (deck draw, pile take, discard), card one-hot, cards taken / 10]. Empty
+// slots are all zero.
+const int HISTORY_LEN = 12;
+const int EVENT_DIM = 1 + 3 + DECK_SIZE + 1;
+const int HISTORY_SIZE = HISTORY_LEN * EVENT_DIM;
 // Channels: hand, discard presence, discard order, melded board, opponent's
 // publicly known cards, unseen cards (still in the deck or hidden in the
-// opponent's hand); scalars: own score / target, opponent score / target,
-// own hand size, opponent hand size, score difference, then the original
-// three meta flags (turn phase, deck fraction, required meld) which stay at
-// the end since the trainer reads obs[-3].
-const int OBS_SPACE_SIZE = DECK_SIZE * 6 + 8;
+// opponent's hand); then the turn history; scalars: own score / target,
+// opponent score / target, own hand size, opponent hand size, score
+// difference, then the original three meta flags (turn phase, deck fraction,
+// required meld) which stay at the end since the trainer reads obs[-3].
+const int OBS_SPACE_SIZE = DECK_SIZE * 6 + HISTORY_SIZE + 8;
+// Auxiliary training targets (ground truth the player cannot see), from the
+// player to move's perspective: opponent's hand (52), table cards whose meld
+// the opponent can extend (52), own hand cards the opponent could take if
+// discarded (52), points the opponent would score at once from each such
+// discard / 50 (52), then opponent holds a complete meld, opponent hand
+// points / 100, opponent can go out next turn, one of the next three deck
+// cards would complete a meld for the player to move.
+const int AUX_SPACE_SIZE = DECK_SIZE * 4 + 4;
 const int DEFAULT_TARGET_SCORE = 500;
 // Safety net so a game between two players who never score cannot run
 // forever: after this many rounds the higher score wins.
 const int DEFAULT_MAX_ROUNDS = 100;
 
 typedef std::vector<int> Meld;
+
+struct Event {
+    int8_t player;
+    int8_t kind;    // 0 deck draw, 1 pile take, 2 discard
+    int8_t card;    // discarded card, or deepest card taken; -1 for a deck draw
+    int8_t count;   // cards taken from the pile
+};
 
 struct GameState {
     std::array<int8_t, DECK_SIZE> card_locations;
@@ -45,6 +67,7 @@ struct GameState {
 
     std::vector<int> discard_pile; // Index 0 is oldest, back() is top card
     std::vector<Meld> table;       // Melds on the board, in the order they were laid; lay-offs extend them
+    std::vector<Event> history;    // Draw/discard events this round, oldest first
 
     int current_player;
     int required_meld_card;
@@ -57,6 +80,7 @@ struct GameState {
     float round_start_p2;
     int round_number;
     bool round_just_ended;  // The last step ended a round (a new one has been dealt unless the game is over)
+    int last_round_out;     // Player who went out to end the last round, 0 if the deck ran out
     int penalised_player;   // Seat that broke the pile-draw obligation (0 = none); ends the game
 
     std::vector<int> cached_required_meld; // Caches the meld computed by compute_legal_mask()
@@ -73,6 +97,7 @@ private:
     int manual_meld_player = 0;   // Seat that chooses its own melds (0 = none: everyone auto-melds)
     int target_score;             // The game ends after the round in which a player reaches this
     int max_rounds;               // ...or after this many rounds, whichever comes first
+    int hand_size;                // Cards dealt to each player at the start of a round
 
     void deal_initial_hands();
     void update_observation_buffer();
@@ -85,6 +110,13 @@ private:
     Meld find_largest_meld_with_card(const std::vector<int>& hand, int card) const;
     std::vector<int> get_hand(int player) const;
     void auto_meld(int player);
+    // Legality of taking the pile from depth `index` for `player` (the rule
+    // behind the draw-phase mask), and what the deepest card would score.
+    bool can_take_pile(int player, size_t index) const;
+    int immediate_points(const std::vector<int>& hand, int card) const;
+    // Would `player`, after adding `extra` cards, be able to go out this turn
+    // (auto-melding leaves at most one card to discard)?
+    bool could_go_out(int player, const std::vector<int>& extra) const;
 
     // Board bookkeeping. place_meld moves a fresh meld from hand to the table;
     // lay_off_card adds one hand card to table meld `index`; find_lay_off
@@ -113,7 +145,8 @@ private:
     float end_round(int acting_player);
 
 public:
-    RummyEnv(uint32_t seed, int target_score = DEFAULT_TARGET_SCORE, int max_rounds = DEFAULT_MAX_ROUNDS);
+    RummyEnv(uint32_t seed, int target_score = DEFAULT_TARGET_SCORE, int max_rounds = DEFAULT_MAX_ROUNDS,
+             int hand_size = DEFAULT_HAND_SIZE);
 
     void reset();
     py::tuple step(int action);
@@ -124,6 +157,10 @@ public:
     int get_current_player() const { return state.current_player; }
     int get_round() const { return state.round_number; }
     bool round_ended() const { return state.round_just_ended; }
+    int get_last_round_out() const { return state.last_round_out; }
+    int get_hand_size() const { return hand_size; }
+    // (player, kind, card, count) for each event of this round, oldest first.
+    std::vector<std::array<int, 4>> get_history() const;
     int get_target_score() const { return target_score; }
     int get_penalised() const { return state.penalised_player; }
     // Card taken from the pile that must be played this turn, or -1.
@@ -165,6 +202,9 @@ public:
     // player who is not to move. Training-time only; never part of the observation.
     void opponent_hand(bool* out) const;
     py::array_t<bool> get_opponent_hand() const;
+    // Auxiliary targets (AUX_SPACE_SIZE floats, see the constant's comment).
+    void aux_targets(float* out) const;
+    py::array_t<float> get_aux_targets() const;
 };
 
 // Persistent worker threads. run(fn) calls fn(worker_index, num_workers) on
@@ -213,12 +253,14 @@ private:
     std::unique_ptr<ThreadPool> pool;
 
 public:
-    VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads);
+    VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads, int target_score = DEFAULT_TARGET_SCORE,
+                       int hand_size = DEFAULT_HAND_SIZE);
 
     int size() const { return static_cast<int>(envs.size()); }
     RummyEnv get(int i) const { return envs.at(i); }
     py::array_t<int32_t> current_players() const;
     py::array_t<bool> opponent_hands() const;
+    py::array_t<float> aux_targets();
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
 };

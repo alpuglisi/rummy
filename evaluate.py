@@ -81,7 +81,7 @@ class ModelPolicy:
         return actions.cpu().numpy()
 
 
-def play_matches(agent, opponent, num_games, seed=0, num_threads=0, full_game=False):
+def play_matches(agent, opponent, num_games, seed=0, num_threads=0, full_game=False, hand_size=7):
     """Agent plays as player 1 in even-indexed games and player 2 in odd ones.
 
     All games are stepped together in one threaded EnvBatch. By default each
@@ -91,7 +91,8 @@ def play_matches(agent, opponent, num_games, seed=0, num_threads=0, full_game=Fa
     """
     if num_threads <= 0:
         num_threads = os.cpu_count() or 1
-    batch = rummy_engine.EnvBatch([rummy_engine.RummyEnv(seed + i) for i in range(num_games)], num_threads)
+    batch = rummy_engine.EnvBatch([rummy_engine.RummyEnv(seed + i, 500, 100, hand_size) for i in range(num_games)],
+                                  num_threads)
     agent_player = np.where(np.arange(num_games) % 2 == 0, 1, 2).astype(np.int32)
     alive = np.ones(num_games, dtype=bool)
 

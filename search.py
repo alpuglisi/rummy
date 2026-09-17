@@ -20,11 +20,19 @@ class SearchPolicy:
 
     needs_env = True
 
-    def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0, belief=False):
+    def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0, belief=False,
+                 horizon=0, endgame=True, reward_scale=0.02):
         self.model = model
         self.device = device
         self.worlds = worlds
         self.max_actions = max_actions
+        # Rollouts stop at the round's end, or after `horizon` engine steps when
+        # set. With `endgame`, the critic's value of the position where a rollout
+        # stops (converted to points with reward_scale) is added to the score
+        # margin so far, so the search values what comes after the round too.
+        self.horizon = horizon
+        self.endgame = endgame
+        self.reward_scale = reward_scale
         self.rng = np.random.default_rng(seed)
         self.num_threads = num_threads if num_threads > 0 else (os.cpu_count() or 1)
         # Belief-weighted worlds: deal the opponent's unknown cards in proportion to the
@@ -40,7 +48,16 @@ class SearchPolicy:
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
         _, _, aux = self.model.forward_with_aux(obs_t, mask_t)
-        return torch.sigmoid(aux).cpu().numpy().astype(np.float32)
+        return torch.sigmoid(aux["opponent"]).cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def _values(self, obs, mask):
+        """Critic value of each position in points, from the perspective of the player to move."""
+        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
+        _, value = self.model(obs_t, mask_t)
+        return value.squeeze(-1).cpu().numpy().astype(np.float64) / self.reward_scale
 
     def reset_stats(self):
         self.decisions = 0
@@ -98,25 +115,53 @@ class SearchPolicy:
         n = batch.size
         start = batch.scores()
         _, dones, round_ends = batch.step(sim_action)
-        batch.halt(dones | round_ends)
+        game_over = dones.copy()
+        stopped = dones | round_ends          # rollout is finished (halted at the next observation)
+        needs_value = round_ends & ~dones     # bootstrap from the new round's first position
+        steps = np.ones(n, dtype=np.int64)
+        boot = np.zeros(n, dtype=np.float64)
 
         self.rollouts += n
         self.rollout_steps += n
         while True:
-            states, masks, _, idx = batch.observe_alive()
+            states, masks, players, idx = batch.observe_alive()
             if len(idx) == 0:
                 break
-            self.rollout_steps += len(idx)
+            at_horizon = (self.horizon > 0) & (steps[idx] >= self.horizon) & ~stopped[idx]
+            # Value the positions where rollouts stop short of the game's end.
+            want = needs_value[idx] | at_horizon
+            if self.endgame and want.any():
+                v = self._values(states[want], masks[want])
+                sign = np.where(players[want] == sim_agent[idx[want]], 1.0, -1.0)
+                boot[idx[want]] = sign * v
+            stop_now = stopped[idx] | at_horizon
+            if stop_now.any():
+                halt = np.zeros(n, dtype=bool)
+                halt[idx[stop_now]] = True
+                batch.halt(halt)
+            live = idx[~stop_now]
+            if len(live) == 0:
+                break
+            self.rollout_steps += len(live)
             actions = np.zeros(n, dtype=np.int64)
-            actions[idx] = self._sample(states, masks)
+            actions[live] = self._sample(states[~stop_now], masks[~stop_now])
             _, dones, round_ends = batch.step(actions)
-            batch.halt(dones | round_ends)
+            steps[live] += 1
+            game_over[live] |= dones[live]
+            stopped[live] |= (dones | round_ends)[live]
+            needs_value[live] |= (round_ends & ~dones)[live]
 
-        # Outcome: the searcher's score gain over the round minus the opponent's.
+        # Outcome: the searcher's score gain so far minus the opponent's, plus the
+        # valued continuation (or +/-100 once the game is decided).
         gain = batch.scores() - start
         own = gain[np.arange(n), sim_agent - 1]
         opp = gain[np.arange(n), 2 - sim_agent]
-        outcome = own - opp
+        outcome = own - opp + boot
+        if game_over.any():
+            final = batch.scores()
+            mine = final[np.arange(n), sim_agent - 1]
+            theirs = final[np.arange(n), 2 - sim_agent]
+            outcome = np.where(game_over, own - opp + np.sign(mine - theirs) * 100.0, outcome)
         # Breaking the pile-draw obligation forfeits the game; score it as a heavy loss.
         penalised = batch.penalised()
         outcome = np.where(penalised == sim_agent, -100.0, np.where(penalised != 0, 100.0, outcome))
