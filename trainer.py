@@ -85,7 +85,7 @@ class PPOTrainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
 
-        self.writer = SummaryWriter(log_dir="runs/rummy_ppo")
+        self.writer = SummaryWriter(log_dir=config.log_dir)
         self.frozen_model = None
         self.best_model = None      # incumbent best policy (see config.best_checkpoint)
         self.best_step = 0

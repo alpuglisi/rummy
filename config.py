@@ -70,3 +70,4 @@ class PPOConfig:
 
     # System
     device: str = "cuda"
+    log_dir: str = "runs/rummy_ppo"   # TensorBoard event files; train.py clears it at the start of a run

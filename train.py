@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import shutil
 
 from config import PPOConfig
 from trainer import PPOTrainer
@@ -20,16 +21,37 @@ def clean_checkpoints():
         print(f"Removed {len(stale)} checkpoint(s) from the previous run.")
 
 
+def clean_logs(log_dir):
+    """Remove the previous run's TensorBoard event files so its curves do not
+    merge into the new run's. TensorBoard shows every event file in a run
+    directory as one run, which mixes old and new data."""
+    if not os.path.isdir(log_dir):
+        return
+    stale = [entry for entry in os.listdir(log_dir)]
+    for name in stale:
+        path = os.path.join(log_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    if stale:
+        print(f"Removed {len(stale)} TensorBoard file(s) from the previous run in {log_dir}/.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep-checkpoints", action="store_true",
                         help="do not delete checkpoints left by a previous run")
+    parser.add_argument("--keep-logs", action="store_true",
+                        help="do not delete TensorBoard event files left by a previous run")
     args = parser.parse_args()
+
+    config = PPOConfig()
 
     if not args.keep_checkpoints:
         clean_checkpoints()
-
-    config = PPOConfig()
+    if not args.keep_logs:
+        clean_logs(config.log_dir)
 
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
