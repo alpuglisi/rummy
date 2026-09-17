@@ -18,6 +18,12 @@ class PPOConfig:
     hidden_size: int = 512
     num_layers: int = 4        # Residual blocks in the trunk after the encoder; heads are hidden_size // 2 wide
     residual: bool = True      # (flat models only) LayerNorm residual trunk; False gives the original plain MLP
+    # Warm-start the live policy from a saved checkpoint instead of random
+    # weights (e.g. a previous run's best.pth). The architecture is read
+    # from the checkpoint itself, so arch/hidden_size/token_dim/token_layers
+    # above are ignored when this is set. The optimizer, opponent pool and
+    # learning-rate schedule all still start fresh. "" disables it.
+    init_checkpoint: str = ""
 
     # Training Parameters
     total_timesteps: int = 100_000_000

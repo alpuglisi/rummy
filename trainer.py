@@ -209,9 +209,21 @@ class PPOTrainer:
             raise ValueError(f"config.obs_dim is {config.obs_dim} but the engine observation is {OBS_DIM} wide")
         self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
                                        blank_known_prob=config.blank_known_prob, hand_size=config.hand_size)
-        self.model = RummyActorCritic(config.obs_dim, config.action_dim, config.hidden_size,
-                                      config.num_layers, config.residual, arch=config.arch,
-                                      token_dim=config.token_dim, token_layers=config.token_layers).to(self.device)
+        if config.init_checkpoint:
+            self.model = RummyActorCritic.from_state_dict(
+                torch.load(config.init_checkpoint, map_location=self.device)).to(self.device)
+            if self.model.obs_dim != config.obs_dim:
+                raise ValueError(f"init_checkpoint '{config.init_checkpoint}' expects an observation width of "
+                                 f"{self.model.obs_dim}, but the current engine produces {config.obs_dim}; "
+                                 f"it was saved under an older observation layout and cannot be used to warm-start "
+                                 f"the live policy (adapt_obs is only for opponents, not the model being trained)")
+            print(f"Warm-started the live policy from {config.init_checkpoint} (arch={self.model.arch}); "
+                 f"config.arch/hidden_size/token_dim/token_layers are ignored for it. The optimizer, opponent "
+                 f"pool and learning-rate schedule all start fresh.")
+        else:
+            self.model = RummyActorCritic(config.obs_dim, config.action_dim, config.hidden_size,
+                                          config.num_layers, config.residual, arch=config.arch,
+                                          token_dim=config.token_dim, token_layers=config.token_layers).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
 
