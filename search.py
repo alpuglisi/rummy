@@ -5,6 +5,9 @@ import torch
 
 import rummy_engine
 from env.vectorized_env import adapt_obs
+from models.ppo_network import masked_categorical, sample_categorical
+
+ACTIONS = 105
 
 
 class SearchPolicy:
@@ -16,14 +19,19 @@ class SearchPolicy:
     outcome: the searcher's score gain over the round minus the opponent's.
     Candidate actions are the model's `max_actions` most likely legal moves.
     All rollouts for all decisions are stepped together in one threaded EnvBatch.
+
+    Data path: the engine writes each observation straight into a host staging
+    buffer (pinned on CUDA), which is uploaded once; every later row selection
+    happens on the device, driven by small host-built index arrays, and the
+    model runs over the selected rows in blocks of at most `max_rows`.
     """
 
     needs_env = True
 
     def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0, belief=False,
-                 horizon=0, endgame=True, reward_scale=0.02, replies=1, max_sims=160_000):
+                 horizon=0, endgame=True, reward_scale=0.02, replies=1, max_sims=160_000, max_rows=16384):
         self.model = model
-        self.device = device
+        self.device = torch.device(device)
         self.worlds = worlds
         self.max_actions = max_actions
         # Opponent replies: at the opponent's first draw after the searcher's
@@ -33,6 +41,7 @@ class SearchPolicy:
         # deeper than a policy-sampled rollout. 1 = no branching.
         self.replies = max(1, replies)
         self.max_sims = max_sims   # rollouts per engine batch; positions are chunked to stay under it
+        self.max_rows = max(1, max_rows)   # rows per model call; larger selections are split
         # Rollouts stop at the round's end, or after `horizon` engine steps when
         # set. With `endgame`, the critic's value of the position where a rollout
         # stops (converted to points with reward_scale) is added to the score
@@ -47,24 +56,112 @@ class SearchPolicy:
         if belief and not getattr(model, "has_aux", False):
             raise ValueError("belief-weighted search needs a checkpoint trained with the opponent-hand head")
         self.belief = belief
+        # Two host staging sets for observations, used alternately per
+        # iteration (see _observe); allocated on first use and kept across calls.
+        self._staging = []
+        self._staging_cap = 0
+        self._staging_slot = 0
         self.reset_stats()
+
+    # ---- staging buffers -------------------------------------------------------
+    def _alloc_staging(self, cap):
+        """One staging set: observation blocks as torch tensors (pinned when the
+        device is CUDA) with numpy views for the engine, plus small host arrays."""
+        pin = self.device.type == "cuda"
+        try:
+            states = torch.empty((cap, rummy_engine.OBS_SPACE_SIZE), dtype=torch.float32, pin_memory=pin)
+            masks = torch.empty((cap, ACTIONS), dtype=torch.bool, pin_memory=pin)
+        except RuntimeError as err:
+            print(f"search: pinned staging buffers unavailable ({err}); using pageable memory")
+            states = torch.empty((cap, rummy_engine.OBS_SPACE_SIZE), dtype=torch.float32)
+            masks = torch.empty((cap, ACTIONS), dtype=torch.bool)
+        return {
+            "states": states, "masks": masks,
+            "states_np": states.numpy(), "masks_np": masks.numpy(),
+            "players": np.empty(cap, dtype=np.int32),
+            "indices": np.empty(cap, dtype=np.int64),
+            "phases": np.empty(cap, dtype=np.int8),
+        }
+
+    def _ensure_staging(self, cap):
+        if cap > self._staging_cap:
+            self._staging = [self._alloc_staging(cap) for _ in range(2)]
+            self._staging_cap = cap
+
+    def _observe(self, batch):
+        """Observe the live games into the next staging set and upload the blocks.
+
+        Returns (states, masks) on the device and (players, indices, phases) on
+        the host, or None when no game is alive. Reuse safety: a staging set is
+        overwritten only two iterations after its upload, and every iteration
+        that uploads ends in a .cpu() (values, branching logits or samples) or
+        in the explicit synchronisation in _evaluate_chunk, so the upload has
+        completed before the set is written again.
+        """
+        buf = self._staging[self._staging_slot]
+        self._staging_slot ^= 1
+        if hasattr(batch, "observe_alive_into"):
+            k = batch.observe_alive_into(buf["states_np"], buf["masks_np"], buf["players"], buf["indices"],
+                                         buf["phases"])
+        else:
+            # Older engine builds: copy the fresh arrays into the same buffers.
+            states, masks, players, indices = batch.observe_alive()
+            k = len(indices)
+            np.copyto(buf["states_np"][:k], states)
+            np.copyto(buf["masks_np"][:k], masks)
+            buf["players"][:k] = players
+            buf["indices"][:k] = indices
+            buf["phases"][:k] = states[:, -3] != 0.0
+        if k == 0:
+            return None
+        states_d = buf["states"][:k].to(self.device, non_blocking=True)
+        masks_d = buf["masks"][:k].to(self.device, non_blocking=True)
+        # Copies of the small host arrays: the set is written again two iterations later.
+        return states_d, masks_d, buf["players"][:k].copy(), buf["indices"][:k].copy(), buf["phases"][:k].copy()
+
+    def _index(self, rows):
+        return torch.as_tensor(rows, dtype=torch.int64, device=self.device)
+
+    # ---- model calls ---------------------------------------------------------
+    def _inputs(self, obs, mask):
+        """Observation and mask as device tensors; numpy input is uploaded, tensors pass through."""
+        obs = adapt_obs(obs if torch.is_tensor(obs) else np.asarray(obs), self.model.obs_dim)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(mask if torch.is_tensor(mask) else np.asarray(mask), dtype=torch.bool,
+                                 device=self.device)
+        return obs_t, mask_t
+
+    def _chunked(self, fn, obs, mask):
+        """fn over row blocks of at most max_rows, outputs concatenated."""
+        n = obs.shape[0]
+        if n <= self.max_rows:
+            return fn(obs, mask)
+        return torch.cat([fn(obs[i:i + self.max_rows], mask[i:i + self.max_rows])
+                          for i in range(0, n, self.max_rows)])
 
     @torch.no_grad()
     def _beliefs(self, obs, mask):
-        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
-        _, _, aux = self.model.forward_with_aux(obs_t, mask_t)
-        return torch.sigmoid(aux["opponent"]).cpu().numpy().astype(np.float32)
+        obs, mask = self._inputs(obs, mask)
+        aux = self._chunked(lambda o, m: self.model.forward_with_aux(o, m)[2]["opponent"], obs, mask)
+        return torch.sigmoid(aux).cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
     def _values(self, obs, mask):
         """Critic value of each position in points, from the perspective of the player to move."""
-        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        mask_t = torch.as_tensor(np.asarray(mask), dtype=torch.bool, device=self.device)
-        _, value = self.model(obs_t, mask_t)
+        obs, mask = self._inputs(obs, mask)
+        value = self._chunked(lambda o, m: self.model(o, m)[1], obs, mask)
         return value.squeeze(-1).cpu().numpy().astype(np.float64) / self.reward_scale
+
+    @torch.no_grad()
+    def _logits(self, obs, mask):
+        obs, mask = self._inputs(obs, mask)
+        return self._chunked(lambda o, m: self.model(o, m)[0], obs, mask)
+
+    @torch.no_grad()
+    def _sample(self, obs, mask):
+        obs, mask = self._inputs(obs, mask)
+        draw = lambda o, m: sample_categorical(masked_categorical(self.model(o, m)[0]))
+        return self._chunked(draw, obs, mask).cpu().numpy()
 
     def reset_stats(self):
         self.decisions = 0
@@ -82,16 +179,6 @@ class SearchPolicy:
             "mean_rollout_steps": self.rollout_steps / max(self.rollouts, 1),
         }
 
-    @torch.no_grad()
-    def _logits(self, obs, mask):
-        obs = adapt_obs(np.asarray(obs), self.model.obs_dim)
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
-        return self.model(obs_t, mask_t)[0]
-
-    def _sample(self, obs, mask):
-        return torch.distributions.Categorical(logits=self._logits(obs, mask)).sample().cpu().numpy()
-
     def evaluate_actions(self, envs):
         """Return, per env, a dict {action: (mean_outcome, n_rollouts)} for its candidates."""
         per_env = self.worlds * self.max_actions * self.replies
@@ -102,12 +189,15 @@ class SearchPolicy:
         return results
 
     def _top_legal(self, probs, mask, k):
-        """Up to k legal actions per row, most probable first."""
-        out = []
-        for i in range(len(probs)):
-            legal = np.flatnonzero(mask[i])
-            out.append(legal[np.argsort(-probs[i, legal])][:k])
-        return out
+        """Up to k legal actions per row, most probable first, from device tensors.
+
+        Returns host arrays (actions [rows, k], valid [rows, k]): the valid
+        entries of each row are a prefix, ordered by descending probability.
+        """
+        k = min(k, ACTIONS)
+        scored = probs.masked_fill(~mask, -1.0)     # legal probabilities are >= 0
+        top, order = torch.topk(scored, k, dim=1)
+        return order.cpu().numpy(), (top >= 0.0).cpu().numpy()
 
     def _evaluate_chunk(self, envs):
         obs = np.stack([e.get_state() for e in envs])
@@ -136,6 +226,7 @@ class SearchPolicy:
 
         batch = rummy_engine.EnvBatch.for_search(envs, repeats, seeds, beliefs, self.num_threads)
         n = batch.size
+        self._ensure_staging(n * self.replies)   # a rollout branches at most once
         start = batch.scores()
         _, dones, round_ends = batch.step(sim_action)
         game_over = dones.copy()
@@ -150,39 +241,55 @@ class SearchPolicy:
         self.rollouts += n
         self.rollout_steps += n
         while True:
-            states, masks, players, idx = batch.observe_alive()
-            if len(idx) == 0:
+            observed = self._observe(batch)
+            if observed is None:
                 break
+            states, masks, players, idx, phases = observed
+            forwarded = False
             at_horizon = (self.horizon > 0) & (steps[idx] >= self.horizon) & ~stopped[idx]
             # Value the positions where rollouts stop short of the game's end.
             want = needs_value[idx] | at_horizon
             if self.endgame and want.any():
-                v = self._values(states[want], masks[want])
+                w = self._index(np.flatnonzero(want))
+                v = self._values(states.index_select(0, w), masks.index_select(0, w))
                 sign = np.where(players[want] == sim_agent[idx[want]], 1.0, -1.0)
                 boot[idx[want]] = sign * v
+                forwarded = True
             needs_value[idx[want]] = False
             stop_now = stopped[idx] | at_horizon
             if stop_now.any():
                 halt = np.zeros(n, dtype=bool)
                 halt[idx[stop_now]] = True
                 batch.halt(halt)
-            live = idx[~stop_now]
+            keep = np.flatnonzero(~stop_now)
+            live = idx[keep]
             if len(live) == 0:
+                # No model call synchronised this iteration's upload: wait for
+                # it before the staging set can be written again (see _observe).
+                if not forwarded and self.device.type == "cuda":
+                    torch.cuda.current_stream().synchronize()
                 break
-            live_states, live_masks, live_players = states[~stop_now], masks[~stop_now], players[~stop_now]
+            if len(keep) == len(idx):
+                live_states, live_masks = states, masks
+            else:
+                kd = self._index(keep)
+                live_states, live_masks = states.index_select(0, kd), masks.index_select(0, kd)
+            live_players, live_phases = players[keep], phases[keep]
 
             # Branch on the opponent's first draw after the searcher's turn.
-            to_branch = ~branched[live] & (live_players != sim_agent[live]) & (live_states[:, -3] == 0.0)
+            to_branch = ~branched[live] & (live_players != sim_agent[live]) & (live_phases == 0)
             if to_branch.any():
-                probs = torch.softmax(self._logits(live_states[to_branch], live_masks[to_branch]), dim=-1).cpu().numpy()
-                options = self._top_legal(probs, live_masks[to_branch], self.replies)
+                b = self._index(np.flatnonzero(to_branch))
+                bmasks = live_masks.index_select(0, b)
+                bprobs = torch.softmax(self._logits(live_states.index_select(0, b), bmasks), dim=-1)
+                options, valid = self._top_legal(bprobs, bmasks, self.replies)
+                rows = live[to_branch]
                 counts = np.ones(n, dtype=np.int32)
-                counts[live[to_branch]] = [len(o) for o in options]
-                branched[live[to_branch]] = True
-                reply_new = np.full(int(counts.sum()), -1, dtype=np.int64)
+                counts[rows] = valid.sum(1)
+                branched[rows] = True
                 offsets = np.cumsum(counts) - counts
-                for j, o in zip(live[to_branch], options):
-                    reply_new[offsets[j]:offsets[j] + len(o)] = o
+                reply_new = np.full(int(counts.sum()), -1, dtype=np.int64)
+                reply_new[(offsets[rows][:, None] + np.arange(options.shape[1]))[valid]] = options[valid]
                 batch = batch.expand(counts)
                 rep = lambda x: np.repeat(x, counts, axis=0)
                 sim_env, sim_action, sim_agent = rep(sim_env), rep(sim_action), rep(sim_agent)
@@ -191,13 +298,30 @@ class SearchPolicy:
                 reply = reply_new
                 n = batch.size
                 self.rollouts += int(counts.sum() - len(counts))
-                continue   # re-observe the expanded batch; forced replies are applied below
+                # The expanded batch's observation is the row-repeat of the
+                # live rows (halted games stay halted), so no re-observation:
+                # the r-th copy of old row i sits at offsets[i] + r.
+                live_counts = counts[live]
+                total = int(live_counts.sum())
+                reps = torch.as_tensor(live_counts, dtype=torch.int64, device=self.device)
+                live_states = live_states.repeat_interleave(reps, dim=0, output_size=total)
+                live_masks = live_masks.repeat_interleave(reps, dim=0, output_size=total)
+                live_players = np.repeat(live_players, live_counts)
+                within = np.arange(total) - np.repeat(np.cumsum(live_counts) - live_counts, live_counts)
+                live = np.repeat(offsets[live], live_counts) + within
 
             self.rollout_steps += len(live)
             actions = np.zeros(n, dtype=np.int64)
-            sampled = self._sample(live_states, live_masks)
             forced = reply[live] >= 0
-            actions[live] = np.where(forced, reply[live], sampled)
+            # Forced replies are applied directly; only the free rows are sampled.
+            free = np.flatnonzero(~forced)
+            if len(free) == len(live):
+                actions[live] = self._sample(live_states, live_masks)
+            else:
+                actions[live[forced]] = reply[live[forced]]
+                if len(free):   # else every live row was branched: _top_legal already synchronised
+                    f = self._index(free)
+                    actions[live[free]] = self._sample(live_states.index_select(0, f), live_masks.index_select(0, f))
             reply[live] = -1
             _, dones, round_ends = batch.step(actions)
             steps[live] += 1
