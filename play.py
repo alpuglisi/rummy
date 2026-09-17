@@ -214,9 +214,12 @@ class Game:
         self.log = []
         self.result = None
         # The computer's moves are played from the main loop once this time has
-        # passed: a 2-6 s pause before its turn so it appears to think, then a
-        # short one between its draw and its discard so both can be followed.
+        # passed. With --pause that's a 2-6 s wait before its turn so it
+        # appears to think, then a short one between its draw and its
+        # discard; by default there's no artificial wait at all, only
+        # whatever the search itself actually takes.
         self.computer_due = None
+        self.pause_enabled = getattr(args, "pause", False)
         # The computer's actual decision (a real search, possibly several
         # seconds) runs on this background thread so it never blocks the
         # window; see tick_computer/_start_computer_search.
@@ -501,12 +504,14 @@ class Game:
             self.computer_step()
 
     def tick_computer(self, now):
-        """Called every frame: schedule and play the computer's moves with pauses.
+        """Called every frame: schedule and play the computer's moves.
 
-        The pause is cosmetic, but the actual decision can be a real search
-        taking several seconds; it runs on a background thread (started by
-        _start_computer_search) so the window keeps redrawing and handling
-        input instead of freezing for however long that takes."""
+        The optional pause (self.pause_enabled, off by default) is purely
+        cosmetic; the actual decision can itself be a real search taking
+        several seconds regardless. Either way it runs on a background
+        thread (started by _start_computer_search) so the window keeps
+        redrawing and handling input instead of freezing for however long
+        that takes."""
         if not self.computer_to_move():
             self.computer_due = None
             if self.sprite and self.sprite.mood == "contemplation":
@@ -523,7 +528,8 @@ class Game:
             return
         if self.computer_due is None:
             drawing = not self.phase_is_discard()
-            self.computer_due = now + (random.uniform(2.0, 6.0) if drawing else random.uniform(0.6, 1.4))
+            delay = (random.uniform(2.0, 6.0) if drawing else random.uniform(0.6, 1.4)) if self.pause_enabled else 0.0
+            self.computer_due = now + delay
             if drawing:
                 self.cpu_turn_value = self.value_for_computer()
                 if self.cpu_turn_value < BAD_HAND:
@@ -743,6 +749,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="random by default; set to replay the same deals and search worlds")
     parser.add_argument("--no-search", action="store_true", help="computer plays the plain policy")
+    parser.add_argument("--pause", action="store_true",
+                        help="add a cosmetic 2-6s/0.6-1.4s wait before the computer's draw/discard "
+                             "(off by default; the search itself still takes however long it takes)")
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
