@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <utility>
 #include <pybind11/pybind11.h>
@@ -54,6 +55,58 @@ const int DEFAULT_MAX_ROUNDS = 100;
 
 typedef std::vector<int> Meld;
 
+// Fixed-capacity card lists for the meld math, so enumerating melds costs no
+// heap traffic. A Hand holds any subset of the deck (a hand plus a pile tail
+// never exceeds 52 distinct cards); a SmallMeld is at most a full-suit run.
+struct Hand {
+    std::array<int8_t, DECK_SIZE> cards;
+    int n = 0;
+
+    int size() const { return n; }
+    bool empty() const { return n == 0; }
+    void push(int c) { cards[n++] = static_cast<int8_t>(c); }
+    const int8_t* begin() const { return cards.data(); }
+    const int8_t* end() const { return cards.data() + n; }
+};
+
+const int MAX_MELD_CARDS = 13;
+
+struct SmallMeld {
+    std::array<int8_t, MAX_MELD_CARDS> cards;
+    int n = 0;
+
+    int size() const { return n; }
+    bool empty() const { return n == 0; }
+    int operator[](int i) const { return cards[i]; }
+    int back() const { return cards[n - 1]; }
+    void push(int c) { cards[n++] = static_cast<int8_t>(c); }
+    void clear() { n = 0; }
+    void pop_back() { n--; }
+    void pop_front() { std::copy(begin() + 1, end(), begin()); n--; }
+    int8_t* begin() { return cards.data(); }
+    int8_t* end() { return cards.data() + n; }
+    const int8_t* begin() const { return cards.data(); }
+    const int8_t* end() const { return cards.data() + n; }
+    bool contains(int c) const { return std::find(begin(), end(), c) != end(); }
+};
+
+// Upper bound on the melds a table can hold: every meld has at least 3 cards.
+const int MAX_TABLE_MELDS = DECK_SIZE / 3;
+
+// Upper bound on the melds one hand can contain: a set per rank plus, per
+// suit, a run for every (start, end) pair.
+const int MAX_MELDS = 13 + 4 * 78;
+
+struct MeldList {
+    std::array<SmallMeld, MAX_MELDS> melds;
+    int n = 0;
+
+    int size() const { return n; }
+    bool empty() const { return n == 0; }
+    const SmallMeld& operator[](int i) const { return melds[i]; }
+    void push(const SmallMeld& m) { melds[n++] = m; }
+};
+
 struct Event {
     int8_t player;
     int8_t kind;    // 0 deck draw, 1 pile take, 2 discard
@@ -84,51 +137,62 @@ struct GameState {
     int last_round_out;     // Player who went out to end the last round, 0 if the deck ran out
     int penalised_player;   // Seat that broke the pile-draw obligation (0 = none); ends the game
 
-    std::vector<int> cached_required_meld; // Caches the meld computed by compute_legal_mask()
+    // The meld the discard-phase mask computed for the required card; written
+    // by the (otherwise read-only) mask computation and consumed by resolve_meld.
+    mutable std::vector<int> cached_required_meld;
 };
 
 class RummyEnv {
 private:
     GameState state;
     std::mt19937 rng;
-    std::vector<int> deck_order;
+    std::array<int8_t, DECK_SIZE> deck_order;
     int deck_index;
 
-    std::vector<float> observation_buffer;
+    // Legal mask of the current state, computed at most once per state: every
+    // public mutation resets mask_valid, so the step that validates an action
+    // and the observation before it share one meld search.
+    mutable std::array<uint8_t, ACTION_SPACE_SIZE> mask_cache;
+    mutable bool mask_valid = false;
+
     int manual_meld_player = 0;   // Seat that chooses its own melds (0 = none: everyone auto-melds)
     int target_score;             // The game ends after the round in which a player reaches this
     int max_rounds;               // ...or after this many rounds, whichever comes first
     int hand_size;                // Cards dealt to each player at the start of a round
 
     void deal_initial_hands();
-    void update_observation_buffer();
 
     // Meld Math
     int get_suit(int card) const { return card / 13; }
     int get_rank(int card) const { return card % 13; }
     int get_point_value(int card) const;
-    std::vector<Meld> find_all_possible_melds(const std::vector<int>& hand) const;
-    Meld find_largest_meld_with_card(const std::vector<int>& hand, int card) const;
-    std::vector<int> get_hand(int player) const;
+    // Sets by rank ascending, then runs by suit, start ascending, then length.
+    void find_all_possible_melds(const Hand& hand, MeldList& out) const;
+    // Largest meld containing `card` (first found wins ties), empty if none.
+    SmallMeld find_largest_meld_with_card(const Hand& hand, int card) const;
+    Hand get_hand(int player) const;
+    int hand_count(int player) const;
     void auto_meld(int player);
     // Legality of taking the pile from depth `index` for `player` (the rule
     // behind the draw-phase mask), and what the deepest card would score.
     bool can_take_pile(int player, size_t index) const;
-    int immediate_points(const std::vector<int>& hand, int card) const;
+    int immediate_points(const Hand& hand, int card) const;
     // Would `player`, after adding `extra` cards, be able to go out this turn
     // (auto-melding leaves at most one card to discard)?
-    bool could_go_out(int player, const std::vector<int>& extra) const;
+    bool could_go_out(int player, const Hand& extra) const;
 
     // Board bookkeeping. place_meld moves a fresh meld from hand to the table;
     // lay_off_card adds one hand card to table meld `index`; find_lay_off
     // returns the first table meld the card extends, or -1.
-    void place_meld(int player, const Meld& m);
+    void place_meld(int player, const SmallMeld& m);
     void lay_off_card(int player, int card, int index);
     int find_lay_off(int card) const;
 
-    // Action validation (Not const because they mutate the cache)
-    std::vector<uint8_t> compute_legal_mask();
-    bool is_legal_action(int action);
+    // Action validation. compute_legal_mask fills mask_cache (and, in the
+    // discard phase, state.cached_required_meld); legal_mask() serves the
+    // cache and recomputes only after a mutation.
+    void compute_legal_mask() const;
+    bool is_legal_action(int action) const;
 
     // Resolves the deep-draw meld obligation. Fails (returns false) if
     // discard_card is itself a member of the required meld -- discarding
@@ -145,6 +209,10 @@ private:
     void start_round();
     float end_round(int acting_player);
 
+    // After a redeal, list the cards that are out of the deck in the drawn
+    // prefix of deck_order so the whole array is a permutation again.
+    void restore_deck_prefix();
+
 public:
     RummyEnv(uint32_t seed, int target_score = DEFAULT_TARGET_SCORE, int max_rounds = DEFAULT_MAX_ROUNDS,
              int hand_size = DEFAULT_HAND_SIZE);
@@ -156,6 +224,7 @@ public:
     bool is_done() const { return state.is_terminal; }
     float get_score(int player) const;
     int get_current_player() const { return state.current_player; }
+    bool in_discard_phase() const { return state.turn_phase_is_discard; }
     int get_round() const { return state.round_number; }
     bool round_ended() const { return state.round_just_ended; }
     int get_last_round_out() const { return state.last_round_out; }
@@ -193,11 +262,15 @@ public:
     void randomize_hidden_weighted_py(uint32_t seed,
                                       py::array_t<float, py::array::c_style | py::array::forcecast> weights);
 
-    py::array_t<uint8_t> get_legal_actions();
+    py::array_t<uint8_t> get_legal_actions() const;
     py::array_t<float> get_state() const;
 
-    const std::vector<float>& observation() const { return observation_buffer; }
-    std::vector<uint8_t> legal_mask() { return compute_legal_mask(); }
+    // The observation (OBS_SPACE_SIZE floats) written straight into `out`.
+    void observe(float* out) const;
+    const std::array<uint8_t, ACTION_SPACE_SIZE>& legal_mask() const {
+        if (!mask_valid) compute_legal_mask();
+        return mask_cache;
+    }
 
     // Ground truth for the auxiliary prediction target: the cards held by the
     // player who is not to move. Training-time only; never part of the observation.
@@ -243,6 +316,61 @@ void parallel_for(ThreadPool* pool, int n, F&& fn) {
     });
 }
 
+// A contiguous array of engines constructed and destroyed across a thread
+// pool: search batches hold up to ~160k copies, and copying (or freeing)
+// them one after another on the calling thread was most of a batch's cost.
+// Movable, not copyable.
+class EnvArray {
+private:
+    RummyEnv* items = nullptr;
+    size_t count = 0;
+    ThreadPool* pool = nullptr;   // shared with the owner; used for destruction
+
+    void destroy();
+
+public:
+    EnvArray() = default;
+    // fill(g, emplace) runs for every group g in [0, groups) across the pool
+    // and constructs that group's slots with emplace(slot, ctor args...),
+    // which returns the new engine; the groups must cover every slot exactly
+    // once. A group runs on one thread, so copies of a source made by one
+    // group may be followed by a move of that source within the same group.
+    template <typename Fill>
+    EnvArray(size_t n, ThreadPool* pool, int groups, Fill&& fill);
+    EnvArray(EnvArray&& other) noexcept { *this = std::move(other); }
+    EnvArray& operator=(EnvArray&& other) noexcept;
+    EnvArray(const EnvArray&) = delete;
+    EnvArray& operator=(const EnvArray&) = delete;
+    ~EnvArray() { destroy(); }
+
+    size_t size() const { return count; }
+    RummyEnv& operator[](size_t i) { return items[i]; }
+    const RummyEnv& operator[](size_t i) const { return items[i]; }
+    RummyEnv* data() { return items; }
+    const RummyEnv* data() const { return items; }
+};
+
+template <typename Fill>
+EnvArray::EnvArray(size_t n, ThreadPool* pool_, int groups, Fill&& fill) : count(n), pool(pool_) {
+    if (n == 0) return;
+    items = std::allocator<RummyEnv>().allocate(n);
+    std::vector<uint8_t> built(n, 0);
+    auto emplace = [&](size_t slot, auto&&... args) -> RummyEnv& {
+        new (items + slot) RummyEnv(std::forward<decltype(args)>(args)...);
+        built[slot] = 1;
+        return items[slot];
+    };
+    try {
+        parallel_for(pool, groups, [&](int g) { fill(g, emplace); });
+    } catch (...) {
+        for (size_t i = 0; i < n; i++) if (built[i]) items[i].~RummyEnv();
+        std::allocator<RummyEnv>().deallocate(items, n);
+        items = nullptr;
+        count = 0;
+        throw;
+    }
+}
+
 void write_observation(const RummyEnv& env, int i, float* states, bool* masks);
 
 // Steps N independent engines in one call with the GIL released, optionally
@@ -253,6 +381,9 @@ private:
     std::vector<RummyEnv> envs;
     std::unique_ptr<ThreadPool> pool;
 
+    void step_raw(const int64_t* actions, float* states, bool* masks, float* rewards, bool* dones,
+                  bool* round_ends, int32_t* round_outs);
+
 public:
     VectorizedRummyEnv(int num_envs, uint32_t seed, int num_threads, int target_score = DEFAULT_TARGET_SCORE,
                        int hand_size = DEFAULT_HAND_SIZE);
@@ -262,8 +393,14 @@ public:
     py::array_t<int32_t> current_players() const;
     py::array_t<bool> opponent_hands() const;
     py::array_t<float> aux_targets();
+    // Same as aux_targets(), written into a caller-provided float32 [N, AUX_SPACE_SIZE] array.
+    void aux_targets_into(py::object out);
     py::tuple reset();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
+    // Same as step(), written into caller-provided arrays of exact shape and dtype.
+    void step_into(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions, py::object states,
+                   py::object masks, py::object rewards, py::object dones, py::object round_ends,
+                   py::object round_outs);
 };
 
 // A batch of arbitrary games (copied from Python RummyEnv objects) stepped in
@@ -271,9 +408,15 @@ public:
 // ignore further actions. Used for evaluation matches and search rollouts.
 class EnvBatch {
 private:
-    std::vector<RummyEnv> envs;
+    std::unique_ptr<ThreadPool> pool;   // declared before envs: they are destroyed on it
+    EnvArray envs;
     std::vector<uint8_t> alive;
-    std::unique_ptr<ThreadPool> pool;
+
+    EnvBatch(EnvArray&& sources, std::unique_ptr<ThreadPool>&& pool);
+    void init_alive();
+    std::vector<int> alive_indices() const;
+    void observe_alive_raw(const std::vector<int>& idx, float* states, bool* masks, int32_t* players,
+                           int64_t* indices, int8_t* phases);
 
 public:
     EnvBatch(const std::vector<RummyEnv>& sources, int num_threads);
@@ -291,11 +434,16 @@ public:
         py::object weights, int num_threads);
 
     int size() const { return static_cast<int>(envs.size()); }
-    RummyEnv get(int i) const { return envs.at(i); }
+    RummyEnv get(int i) const;
     py::array_t<bool> alive_mask() const;
     py::tuple observe();
     // Observation for the live games only: (states, masks, players, indices).
     py::tuple observe_alive();
+    // Same, written into the first k rows of caller-provided arrays (states
+    // float32 [cap, OBS], masks bool [cap, 105], players int32 [cap], indices
+    // int64 [cap], phases int8 [cap]: 1 in the discard phase); returns k.
+    int observe_alive_into(py::object states, py::object masks, py::object players, py::object indices,
+                           py::object phases);
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
     py::array_t<float> scores() const;
     py::array_t<int32_t> penalised() const;
