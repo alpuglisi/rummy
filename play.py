@@ -1,6 +1,9 @@
 """Play Rummy against the trained model.
 
-    python play.py [checkpoint] [--worlds 64 --actions 6 --seed 1 --no-search]
+    python play.py [checkpoint] [--worlds 64 --actions 6 --seed N --no-search]
+
+Deals are random on every launch; pass --seed to replay a particular game
+(the seed used is printed at start).
 
 Without a checkpoint argument the game uses checkpoints/best.pth, which the
 trainer updates whenever the live policy beats the previous best head-to-head.
@@ -392,12 +395,16 @@ def main():
                         help="model to play against (default: the trainer's best checkpoint)")
     parser.add_argument("--worlds", type=int, default=64)
     parser.add_argument("--actions", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="random by default; set to replay the same deals and search worlds")
     parser.add_argument("--no-search", action="store_true", help="computer plays the plain policy")
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
         sys.exit(f"checkpoint not found: {args.checkpoint} (train first, or pass a .pth file)")
+    if args.seed is None:
+        args.seed = int.from_bytes(os.urandom(4), "little") % (2**31 - 1)
+    print(f"Seed {args.seed} (pass --seed {args.seed} to replay these deals)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
     print(f"Playing against {args.checkpoint}")
