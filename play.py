@@ -27,8 +27,15 @@ of a round. Keys: A toggles the advisor (the search's expected round outcome
 for each of your legal moves, assuming you lay down everything you can: a
 ranked list appears top right and the best move is framed in green), N
 starts a new game, Q quits.
+
+The cat beside the deck reacts to the game (frames from assets/sprite, cut by
+tools/build_sprites.py): it ponders while the computer is thinking, cheers a
+strong computer move or a poor one of yours, and sulks at a strong move of
+yours, a weak one of its own, or a bad hand, judged by how the critic's
+expected margin for the computer moves.
 """
 import argparse
+import json
 import os
 import random
 import sys
@@ -40,6 +47,7 @@ import torch
 
 import rummy_engine
 from config import PPOConfig
+from env.vectorized_env import adapt_obs
 from evaluate import ModelPolicy, load_model
 from search import SearchPolicy
 
@@ -53,6 +61,15 @@ HIGHLIGHT = (255, 215, 0)
 TEXT = (245, 245, 245)
 DIM = (170, 190, 175)
 BEST = (130, 235, 150)
+SPRITE_DIR = os.path.join("assets", "sprite", "frames")
+SPRITE_HEIGHT = 96
+# How the cat reads the game, in points of the computer's expected margin:
+# a swing this large after a move counts as a strong or poor move, and a
+# position this far behind at the start of its turn counts as a bad hand.
+MOVE_SWING = 10.0
+BAD_HAND = -20.0
+POSITIVE = ["joy", "excitement", "happiness", "satisfaction"]
+NEGATIVE = ["confusion", "frustration", "fear"]
 
 
 def card_name(card):
@@ -79,8 +96,110 @@ class Assets:
             pygame.draw.line(self.back, (90, 110, 190), (12, y), (CARD_W - 12, y + 6), 2)
 
 
+class Sprite:
+    """The cat in the corner: a queue of one-shot reactions, a looping mood
+    while it waits, and a speech bubble. Frames come from tools/build_sprites.py."""
+
+    def __init__(self, folder=SPRITE_DIR):
+        self.frames = {}
+        manifest = os.path.join(folder, "manifest.json")
+        if os.path.exists(manifest):
+            with open(manifest) as f:
+                spec = json.load(f)
+            for emotion, entries in spec.items():
+                surfaces = []
+                for e in entries:
+                    img = pygame.image.load(os.path.join(folder, e["file"])).convert_alpha()
+                    scale = SPRITE_HEIGHT / img.get_height()
+                    surfaces.append(pygame.transform.smoothscale(
+                        img, (max(1, int(img.get_width() * scale)), SPRITE_HEIGHT)))
+                self.frames[emotion] = surfaces
+        self.queue = []          # pending one-shot reactions: (emotion, loops, fps, text)
+        self.mood = None         # emotion looped whenever the queue is empty (e.g. contemplation)
+        self.current = None      # (emotion, loops_left or None, fps)
+        self.frame = 0
+        self.next_frame_at = 0.0
+        self.bubble = None
+        self.bubble_until = 0.0
+        self.idle = "happiness" if "happiness" in self.frames else next(iter(self.frames), None)
+
+    @property
+    def available(self):
+        return bool(self.frames)
+
+    def react(self, emotion, text=None, loops=2, fps=6):
+        """Queue a one-shot animation; `emotion` may be a list to pick from."""
+        if isinstance(emotion, (list, tuple)):
+            emotion = random.choice([e for e in emotion if e in self.frames] or [None])
+        if emotion not in self.frames:
+            return
+        self.queue.append((emotion, loops, fps, text))
+
+    def set_mood(self, emotion):
+        """Loop `emotion` (or nothing) whenever no reaction is playing."""
+        self.mood = emotion if emotion in self.frames else None
+        if self.current is not None and self.current[1] is None:
+            self.current = None      # a mood loop is replaced immediately
+
+    def say(self, text, seconds=3.0, now=None):
+        self.bubble = text
+        self.bubble_until = (now if now is not None else time.time()) + seconds
+
+    def update(self, now):
+        if self.current is None:
+            if self.queue:
+                emotion, loops, fps, text = self.queue.pop(0)
+                self.current = [emotion, loops, fps]
+                if text:
+                    self.say(text, now=now)
+            elif self.mood:
+                self.current = [self.mood, None, 3]
+            else:
+                return
+            self.frame = 0
+            self.next_frame_at = now + 1.0 / self.current[2]
+            return
+        if now < self.next_frame_at:
+            return
+        emotion, loops, fps = self.current
+        self.frame += 1
+        self.next_frame_at = now + 1.0 / fps
+        if self.frame >= len(self.frames[emotion]):
+            self.frame = 0
+            if loops is not None:
+                self.current[1] = loops - 1
+                if self.current[1] <= 0:
+                    self.current = None
+            elif self.mood != emotion:
+                self.current = None
+
+    def image(self):
+        if self.current is not None:
+            return self.frames[self.current[0]][self.frame]
+        return self.frames[self.idle][0] if self.idle else None
+
+    def draw(self, screen, font, right_x, bottom_y, now):
+        """Draw the cat bottom-right-aligned at (right_x, bottom_y) with its bubble above."""
+        img = self.image()
+        if img is None:
+            return
+        x = right_x - img.get_width()
+        y = bottom_y - img.get_height()
+        screen.blit(img, (x, y))
+        if self.bubble and now < self.bubble_until:
+            tag = font.render(self.bubble, True, (25, 25, 25))
+            box = tag.get_rect().inflate(14, 8)
+            box.bottomright = (right_x, y - 6)
+            box.left = max(box.left, 4)
+            pygame.draw.rect(screen, (250, 250, 240), box, border_radius=8)
+            pygame.draw.polygon(screen, (250, 250, 240),
+                                [(box.right - 26, box.bottom), (box.right - 14, box.bottom),
+                                 (box.right - 18, box.bottom + 7)])
+            screen.blit(tag, tag.get_rect(center=box.center))
+
+
 class Game:
-    def __init__(self, model, device, args):
+    def __init__(self, model, device, args, sprite=None):
         self.env = rummy_engine.RummyEnv(args.seed)
         self.human = 1
         self.computer = ModelPolicy(model, device) if args.no_search else SearchPolicy(
@@ -95,6 +214,13 @@ class Game:
         # passed: a 2-6 s pause before its turn so it appears to think, then a
         # short one between its draw and its discard so both can be followed.
         self.computer_due = None
+        # The cat reacts to how the computer's prospects change; values are the
+        # critic's, converted to points (see value_for_computer).
+        self.sprite = sprite
+        self.model = model
+        self.device = device
+        self.turn_value = None       # computer's expected margin when the human's turn began
+        self.cpu_turn_value = None   # ...and when the computer's turn began
         self.env.set_manual_meld(self.human)
         self.new_game()
 
@@ -107,6 +233,11 @@ class Game:
         self.advice = {}
         self.selected.clear()
         self.computer_due = None
+        self.turn_value = None
+        self.cpu_turn_value = None
+        if self.sprite:
+            self.sprite.queue.clear()
+            self.sprite.set_mood(None)
         self.refresh_advice()
 
     def obs(self):
@@ -167,6 +298,58 @@ class Game:
         rows = self.advice_rows()
         return rows[0][0] if rows else None
 
+    @torch.no_grad()
+    def value_for_computer(self):
+        """The critic's expected margin for the computer, in points, from the current state."""
+        if self.env.is_done():
+            return 0.0
+        obs = adapt_obs(self.obs()[None], self.model.obs_dim)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(self.legal()[None], dtype=torch.bool, device=self.device)
+        value = float(self.model(obs_t, mask_t)[1].squeeze()) / PPOConfig.reward_scale
+        return value if self.env.get_current_player() == self.computer_seat() else -value
+
+    def cat(self, emotion, text=None, loops=2):
+        if self.sprite:
+            self.sprite.react(emotion, text, loops)
+
+    def react_to_human_move(self):
+        """After the human's discard: compare the computer's prospects with the start of the turn."""
+        if self.turn_value is None or self.env.round_ended() or self.env.is_done():
+            return
+        swing = self.value_for_computer() - self.turn_value
+        if swing > MOVE_SWING:
+            self.cat(POSITIVE, random.choice(["Thanks for that!", "Ooh, I'll take it.", "Interesting choice..."]))
+        elif swing < -MOVE_SWING:
+            self.cat(NEGATIVE, random.choice(["Ouch. Good move.", "Hmm, didn't see that.", "That hurts."]))
+
+    def react_to_computer_move(self):
+        """After the computer's discard: compare with the start of its turn."""
+        if self.cpu_turn_value is None or self.env.round_ended() or self.env.is_done():
+            return
+        swing = self.value_for_computer() - self.cpu_turn_value
+        if swing > MOVE_SWING:
+            self.cat(["satisfaction", "joy", "happiness"], random.choice(["That'll do.", "Nice.", "Just as planned."]))
+        elif swing < -MOVE_SWING:
+            self.cat(["frustration", "confusion"], random.choice(["Hmm, not my best.", "Ugh.", "Meh."]))
+
+    def react_to_round(self, gain_you, gain_cpu, how):
+        if self.env.is_done():
+            return
+        if gain_cpu > gain_you:
+            self.cat(["joy", "excitement"], "Round's mine!", loops=3)
+        elif gain_you > gain_cpu:
+            if how.startswith("You went out"):
+                self.cat("awe", "You went out already?!")
+            self.cat(["frustration", "confusion"], "Your round. Next one's mine.", loops=3)
+
+    def react_to_game(self, s1, s2):
+        cpu = self.env.get_score(self.computer_seat())
+        if cpu > (s1 if self.computer_seat() == 2 else s2):
+            self.cat("excitement", "I win! Rematch?", loops=4)
+        else:
+            self.cat(["fear", "confusion"], "You got me. Well played.", loops=4)
+
     # --- moves ---------------------------------------------------------------
     def apply(self, action, who):
         pile_before = self.pile()
@@ -179,12 +362,22 @@ class Game:
             text = f"discarded {card_name(action - 53)}"
         round_no = self.env.get_round()
         deck_empty = self.obs()[-2] >= 1.0
+        taken = len(pile_before) - (action - 1) if 1 <= action <= 52 else 0
         reward, done = self.env.step(int(action))
         self.log.append(f"{who} {text}.")
         if self.env.round_ended():
             self.end_round(round_no, "Deck ran out" if deck_empty else f"{who} went out")
         if done:
             self.finish()
+        elif action >= 53:
+            if who == "You":
+                self.react_to_human_move()
+                self.turn_value = None
+            else:
+                self.react_to_computer_move()
+                self.cpu_turn_value = None
+        elif who == "You" and taken >= 4 and self.sprite:
+            self.cat("surprise", "Whoa, big grab.")
         self.refresh_advice()
 
     def end_round(self, round_no, how):
@@ -194,6 +387,9 @@ class Game:
         self.selected.clear()
         self.log.append(f"Round {round_no} over ({how}): you {gain_you:+.0f}, computer {gain_cpu:+.0f}.  "
                         f"Score {s1:.0f} - {s2:.0f}.")
+        self.turn_value = None
+        self.cpu_turn_value = None
+        self.react_to_round(gain_you, gain_cpu, how)
 
     def finish(self):
         s1, s2 = self.env.get_score(1), self.env.get_score(2)
@@ -208,6 +404,9 @@ class Game:
             outcome = "You win!" if s1 > s2 else "Computer wins."
         self.result = f"{outcome}  Final score: you {s1:.0f} - computer {s2:.0f}.  Press N for a new game."
         self.log.append(self.result)
+        if self.sprite:
+            self.sprite.set_mood(None)
+        self.react_to_game(s1, s2)
 
     def toggle_select(self, card):
         self.selected.symmetric_difference_update({int(card)})
@@ -289,10 +488,20 @@ class Game:
         """Called every frame: schedule and play the computer's moves with pauses."""
         if not self.computer_to_move():
             self.computer_due = None
+            if self.sprite and self.sprite.mood == "contemplation":
+                self.sprite.set_mood(None)
+            if self.turn_value is None and not self.env.is_done():
+                self.turn_value = self.value_for_computer()   # the human's turn is starting
             return
         if self.computer_due is None:
             drawing = not self.phase_is_discard()
             self.computer_due = now + (random.uniform(2.0, 6.0) if drawing else random.uniform(0.6, 1.4))
+            if drawing:
+                self.cpu_turn_value = self.value_for_computer()
+                if self.cpu_turn_value < BAD_HAND:
+                    self.cat(["fear", "confusion"], random.choice(["This hand is rough...", "Oh no.", "Not great."]))
+                if self.sprite:
+                    self.sprite.set_mood("contemplation")   # think while the pause runs
         elif now >= self.computer_due:
             self.computer_step()
             self.computer_due = None
@@ -310,6 +519,7 @@ class View:
         self.small = pygame.font.SysFont("dejavusans", 14)
         self.big = pygame.font.SysFont("dejavusans", 26, bold=True)
         self.hit = []   # (rect, action)
+        self.sprite = Sprite()
 
     def text(self, s, x, y, font=None, color=TEXT):
         self.screen.blit((font or self.font).render(s, True, color), (x, y))
@@ -414,6 +624,12 @@ class View:
             label, best = self.advice_label(g, 0)
             self.text(f"deck: {label}", 20, y + CARD_H + 24, self.small, BEST if best else HIGHLIGHT)
 
+        # The cat, right of the deck row, with its speech bubble
+        if self.sprite.available:
+            now = time.time()
+            self.sprite.update(now)
+            self.sprite.draw(self.screen, self.small, WIDTH - 30, y + CARD_H + 4, now)
+
         # Human hand (bottom)
         hand = g.hand()
         self.text(f"You  -  {len(hand)} cards, score {g.env.get_score(g.human):.0f}", 20, 490, self.big)
@@ -495,7 +711,7 @@ def main():
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Rummy vs the model")
     view = View(screen, Assets())
-    game = Game(model, device, args)
+    game = Game(model, device, args, sprite=view.sprite if view.sprite.available else None)
     clock = pygame.time.Clock()
 
     running = True

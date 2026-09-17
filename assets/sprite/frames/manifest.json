@@ -1,0 +1,302 @@
+{
+ "joy": [
+  {
+   "file": "joy_0.png",
+   "w": 62,
+   "h": 97
+  },
+  {
+   "file": "joy_1.png",
+   "w": 61,
+   "h": 92
+  },
+  {
+   "file": "joy_2.png",
+   "w": 69,
+   "h": 91
+  },
+  {
+   "file": "joy_3.png",
+   "w": 59,
+   "h": 92
+  },
+  {
+   "file": "joy_4.png",
+   "w": 77,
+   "h": 92
+  },
+  {
+   "file": "joy_5.png",
+   "w": 53,
+   "h": 91
+  },
+  {
+   "file": "joy_6.png",
+   "w": 69,
+   "h": 121
+  }
+ ],
+ "surprise": [
+  {
+   "file": "surprise_0.png",
+   "w": 54,
+   "h": 93
+  },
+  {
+   "file": "surprise_1.png",
+   "w": 55,
+   "h": 93
+  },
+  {
+   "file": "surprise_2.png",
+   "w": 55,
+   "h": 93
+  },
+  {
+   "file": "surprise_3.png",
+   "w": 54,
+   "h": 92
+  },
+  {
+   "file": "surprise_4.png",
+   "w": 55,
+   "h": 93
+  },
+  {
+   "file": "surprise_5.png",
+   "w": 55,
+   "h": 93
+  },
+  {
+   "file": "surprise_6.png",
+   "w": 54,
+   "h": 93
+  }
+ ],
+ "excitement": [
+  {
+   "file": "excitement_0.png",
+   "w": 65,
+   "h": 90
+  },
+  {
+   "file": "excitement_1.png",
+   "w": 62,
+   "h": 89
+  },
+  {
+   "file": "excitement_2.png",
+   "w": 60,
+   "h": 97
+  },
+  {
+   "file": "excitement_3.png",
+   "w": 64,
+   "h": 91
+  },
+  {
+   "file": "excitement_4.png",
+   "w": 60,
+   "h": 89
+  },
+  {
+   "file": "excitement_5.png",
+   "w": 65,
+   "h": 83
+  },
+  {
+   "file": "excitement_6.png",
+   "w": 65,
+   "h": 89
+  }
+ ],
+ "confusion": [
+  {
+   "file": "confusion_0.png",
+   "w": 56,
+   "h": 87
+  },
+  {
+   "file": "confusion_1.png",
+   "w": 56,
+   "h": 86
+  },
+  {
+   "file": "confusion_2.png",
+   "w": 56,
+   "h": 86
+  },
+  {
+   "file": "confusion_3.png",
+   "w": 55,
+   "h": 86
+  },
+  {
+   "file": "confusion_4.png",
+   "w": 56,
+   "h": 86
+  },
+  {
+   "file": "confusion_5.png",
+   "w": 56,
+   "h": 85
+  },
+  {
+   "file": "confusion_6.png",
+   "w": 55,
+   "h": 86
+  }
+ ],
+ "happiness": [
+  {
+   "file": "happiness_0.png",
+   "w": 54,
+   "h": 91
+  },
+  {
+   "file": "happiness_1.png",
+   "w": 55,
+   "h": 90
+  },
+  {
+   "file": "happiness_2.png",
+   "w": 55,
+   "h": 90
+  }
+ ],
+ "satisfaction": [
+  {
+   "file": "satisfaction_0.png",
+   "w": 55,
+   "h": 89
+  },
+  {
+   "file": "satisfaction_1.png",
+   "w": 55,
+   "h": 89
+  },
+  {
+   "file": "satisfaction_2.png",
+   "w": 55,
+   "h": 88
+  },
+  {
+   "file": "satisfaction_3.png",
+   "w": 64,
+   "h": 88
+  }
+ ],
+ "frustration": [
+  {
+   "file": "frustration_0.png",
+   "w": 54,
+   "h": 86
+  },
+  {
+   "file": "frustration_1.png",
+   "w": 53,
+   "h": 85
+  },
+  {
+   "file": "frustration_2.png",
+   "w": 59,
+   "h": 86
+  },
+  {
+   "file": "frustration_3.png",
+   "w": 56,
+   "h": 85
+  },
+  {
+   "file": "frustration_4.png",
+   "w": 57,
+   "h": 85
+  },
+  {
+   "file": "frustration_5.png",
+   "w": 56,
+   "h": 86
+  },
+  {
+   "file": "frustration_6.png",
+   "w": 57,
+   "h": 85
+  }
+ ],
+ "contemplation": [
+  {
+   "file": "contemplation_0.png",
+   "w": 53,
+   "h": 90
+  },
+  {
+   "file": "contemplation_1.png",
+   "w": 54,
+   "h": 90
+  },
+  {
+   "file": "contemplation_2.png",
+   "w": 53,
+   "h": 91
+  },
+  {
+   "file": "contemplation_3.png",
+   "w": 53,
+   "h": 89
+  }
+ ],
+ "awe": [
+  {
+   "file": "awe_0.png",
+   "w": 52,
+   "h": 90
+  },
+  {
+   "file": "awe_1.png",
+   "w": 53,
+   "h": 89
+  },
+  {
+   "file": "awe_2.png",
+   "w": 56,
+   "h": 89
+  }
+ ],
+ "fear": [
+  {
+   "file": "fear_0.png",
+   "w": 51,
+   "h": 79
+  },
+  {
+   "file": "fear_1.png",
+   "w": 53,
+   "h": 74
+  },
+  {
+   "file": "fear_2.png",
+   "w": 58,
+   "h": 71
+  },
+  {
+   "file": "fear_3.png",
+   "w": 52,
+   "h": 75
+  },
+  {
+   "file": "fear_4.png",
+   "w": 52,
+   "h": 78
+  },
+  {
+   "file": "fear_5.png",
+   "w": 52,
+   "h": 77
+  },
+  {
+   "file": "fear_6.png",
+   "w": 54,
+   "h": 77
+  }
+ ]
+}
