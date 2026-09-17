@@ -26,6 +26,22 @@ GLOBAL_AUX = 3 + 1 + 1 + 3   # flags, hand_points, turns_left, goes_out
 CARD_FEATURES = 6 + 13 + 4   # six channels + rank one-hot + suit one-hot
 
 
+def sample_categorical(dist):
+    """One sample per row from a Categorical, without the device syncs
+    torch.multinomial adds. This is the exponential-race draw that
+    torch.multinomial itself uses for a single sample (argmax of p / Exp(1)),
+    minus its two host-side sanity checks, so the result and the RNG stream
+    are identical to dist.sample()."""
+    probs = dist.probs
+    return torch.argmax(probs / torch.empty_like(probs).exponential_(), dim=-1)
+
+
+def masked_categorical(logits):
+    """Categorical over masked logits; argument validation is skipped because
+    every check it does syncs the GPU, and the logits come from our own network."""
+    return Categorical(logits=logits, validate_args=False)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
@@ -235,8 +251,8 @@ class RummyActorCritic(nn.Module):
 
     def get_action(self, state, action_mask):
         logits, value = self.forward(state, action_mask)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
+        dist = masked_categorical(logits)
+        action = sample_categorical(dist)
         return action, dist.log_prob(action), value
 
     @classmethod
