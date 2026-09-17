@@ -4,9 +4,9 @@
 
 int RummyEnv::get_point_value(int card) const {
     int rank = get_rank(card);
-    if (rank == 0) return 15; // Ace
-    if (rank >= 9) return 10; // 10, J, Q, K
-    return 5;                 // 2-9
+    if (rank == 0) return 1;   // Ace
+    if (rank >= 9) return 10;  // 10, J, Q, K
+    return rank + 1;           // 2-9 at face value
 }
 
 std::vector<Meld> RummyEnv::find_all_possible_melds(const std::vector<int>& hand) const {
@@ -149,7 +149,8 @@ bool RummyEnv::can_lay_off(int card, const Meld& meld) const {
 
 // --- Environment Logic ---
 
-RummyEnv::RummyEnv(uint32_t seed) : rng(seed), deck_index(0) {
+RummyEnv::RummyEnv(uint32_t seed, int target_score, int max_rounds)
+    : rng(seed), deck_index(0), target_score(target_score), max_rounds(max_rounds) {
     deck_order.resize(DECK_SIZE);
     for (int i = 0; i < DECK_SIZE; i++) deck_order[i] = i;
     observation_buffer.resize(OBS_SPACE_SIZE, 0.0f);
@@ -164,29 +165,66 @@ void RummyEnv::deal_initial_hands() {
 }
 
 void RummyEnv::reset() {
+    state.current_player = 1;
+    state.is_terminal = false;
+    state.p1_score = 0.0f;
+    state.p2_score = 0.0f;
+    state.round_number = 1;
+    state.penalised_player = 0;
+    start_round();
+    state.round_just_ended = false;
+    update_observation_buffer();
+}
+
+void RummyEnv::start_round() {
     std::shuffle(deck_order.begin(), deck_order.end(), rng);
     deck_index = 0;
 
     state.card_locations.fill(0);
     state.discard_pile.clear();
     state.table.clear();
-
-    state.current_player = 1;
+    state.publicly_known.fill(0);
     state.required_meld_card = -1;
     state.turn_phase_is_discard = false;
-    state.is_terminal = false;
-    state.p1_score = 0.0f;
-    state.p2_score = 0.0f;
     state.cached_required_meld.clear();
-    state.publicly_known.fill(0);
+    state.round_start_p1 = state.p1_score;
+    state.round_start_p2 = state.p2_score;
 
     deal_initial_hands();
 
     int first_discard = deck_order[deck_index++];
     state.card_locations[first_discard] = 3;
     state.discard_pile.push_back(first_discard);
+}
 
-    update_observation_buffer();
+float RummyEnv::end_round(int acting_player) {
+    int hand_value[3] = {0, 0, 0};
+    for (int i = 0; i < DECK_SIZE; i++) {
+        const int loc = state.card_locations[i];
+        if (loc == 1 || loc == 2) hand_value[loc] += get_point_value(i);
+    }
+    state.p1_score -= static_cast<float>(hand_value[1]);
+    state.p2_score -= static_cast<float>(hand_value[2]);
+
+    const float own_gain = (acting_player == 1) ? state.p1_score - state.round_start_p1
+                                                : state.p2_score - state.round_start_p2;
+    const float opp_gain = (acting_player == 1) ? state.p2_score - state.round_start_p2
+                                                : state.p1_score - state.round_start_p1;
+    float reward = own_gain - opp_gain;
+
+    state.round_just_ended = true;
+    if (state.p1_score >= target_score || state.p2_score >= target_score || state.round_number >= max_rounds) {
+        state.is_terminal = true;
+        if (state.p1_score != state.p2_score) {
+            const int winner = (state.p1_score > state.p2_score) ? 1 : 2;
+            reward += (winner == acting_player) ? 100.0f : -100.0f;
+        }
+    } else {
+        state.round_number++;
+        state.current_player = (acting_player == 1) ? 2 : 1;
+        start_round();
+    }
+    return reward;
 }
 
 void RummyEnv::update_observation_buffer() {
@@ -224,6 +262,8 @@ void RummyEnv::update_observation_buffer() {
 
     const float own_score = (state.current_player == 1) ? state.p1_score : state.p2_score;
     const float opp_score = (state.current_player == 1) ? state.p2_score : state.p1_score;
+    observation_buffer[OBS_SPACE_SIZE - 8] = own_score / static_cast<float>(target_score);
+    observation_buffer[OBS_SPACE_SIZE - 7] = opp_score / static_cast<float>(target_score);
     observation_buffer[OBS_SPACE_SIZE - 6] = static_cast<float>(own_hand_size) / 26.0f;
     observation_buffer[OBS_SPACE_SIZE - 5] = static_cast<float>(opp_hand_size) / 26.0f;
     observation_buffer[OBS_SPACE_SIZE - 4] = (own_score - opp_score) / 100.0f;
@@ -340,23 +380,6 @@ bool RummyEnv::resolve_meld(int player, int discard_card) {
     return true;
 }
 
-float RummyEnv::settle_terminal(int winner) {
-    state.is_terminal = true;
-
-    int p1_hand_value = 0, p2_hand_value = 0;
-    for (int i = 0; i < DECK_SIZE; i++) {
-        if (state.card_locations[i] == 1) p1_hand_value += get_point_value(i);
-        else if (state.card_locations[i] == 2) p2_hand_value += get_point_value(i);
-    }
-    state.p1_score += static_cast<float>(p2_hand_value);
-    state.p2_score += static_cast<float>(p1_hand_value);
-
-    if (winner != -1) return 100.0f;
-
-    float diff = state.p1_score - state.p2_score;
-    return (state.current_player == 1) ? diff : -diff;
-}
-
 py::tuple RummyEnv::step(int action) {
     auto result = step_raw(action);
     return py::make_tuple(result.first, result.second);
@@ -375,6 +398,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
     }
 
     int acting_player = state.current_player;
+    state.round_just_ended = false;
 
     if (!state.turn_phase_is_discard) {
         // --- DRAW PHASE ---
@@ -406,6 +430,7 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
             bool melded = resolve_meld(acting_player, discard_card);
             if (!melded) {
                 state.is_terminal = true;
+                state.penalised_player = acting_player;
                 update_observation_buffer();
                 return {-50.0f, true};
             }
@@ -420,19 +445,13 @@ std::pair<float, bool> RummyEnv::step_raw(int action) {
         // 3. Auto-meld remaining valid sets/runs to score points naturally
         if (acting_player != manual_meld_player) auto_meld(acting_player);
 
-        // Win condition: the acting player discarded their last card (after
-        // melding / laying off the rest). Going out always ends on a discard.
-        if (get_hand(acting_player).empty()) {
-            float reward = settle_terminal(acting_player);
+        // The round ends when the acting player discards their last card
+        // (after melding / laying off the rest) or the deck runs out. The
+        // game itself ends only once a player has reached the target score.
+        if (get_hand(acting_player).empty() || deck_index >= DECK_SIZE) {
+            float reward = end_round(acting_player);
             update_observation_buffer();
-            return {reward, true};
-        }
-
-        // Check if the deck is empty after the turn finishes
-        if (deck_index >= DECK_SIZE) {
-            float reward = settle_terminal(-1);
-            update_observation_buffer();
-            return {reward, true};
+            return {reward, state.is_terminal};
         }
 
         state.turn_phase_is_discard = false;
@@ -795,23 +814,42 @@ py::tuple EnvBatch::step(py::array_t<int64_t, py::array::c_style | py::array::fo
     const int64_t* a = actions.data();
     py::array_t<float> rewards(n);
     py::array_t<bool> dones(n);
+    py::array_t<bool> round_ends(n);
     float* r = rewards.mutable_data();
     bool* d = dones.mutable_data();
+    bool* e = round_ends.mutable_data();
     {
         py::gil_scoped_release release;
         parallel_for(pool.get(), n, [&](int i) {
             if (!alive[i]) {
                 r[i] = 0.0f;
                 d[i] = true;
+                e[i] = false;
                 return;
             }
             auto result = envs[i].step_raw(static_cast<int>(a[i]));
             r[i] = result.first;
             d[i] = result.second;
+            e[i] = envs[i].round_ended();
             if (result.second) alive[i] = 0;
         });
     }
-    return py::make_tuple(rewards, dones);
+    return py::make_tuple(rewards, dones, round_ends);
+}
+
+void EnvBatch::halt(py::array_t<bool, py::array::c_style | py::array::forcecast> which) {
+    if (which.ndim() != 1 || which.shape(0) != size()) {
+        throw std::invalid_argument("which must be a 1-D bool array with one entry per environment");
+    }
+    const bool* w = which.data();
+    for (int i = 0; i < size(); i++) if (w[i]) alive[i] = 0;
+}
+
+py::array_t<int32_t> EnvBatch::penalised() const {
+    py::array_t<int32_t> out(size());
+    int32_t* o = out.mutable_data();
+    for (int i = 0; i < size(); i++) o[i] = envs[i].get_penalised();
+    return out;
 }
 
 py::array_t<float> EnvBatch::scores() const {
@@ -854,11 +892,20 @@ void EnvBatch::randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_styl
 // --- Pybind11 Module Definition ---
 PYBIND11_MODULE(rummy_engine, m) {
     py::class_<RummyEnv>(m, "RummyEnv")
-        .def(py::init<uint32_t>())
+        .def(py::init<uint32_t, int, int>(), py::arg("seed"), py::arg("target_score") = DEFAULT_TARGET_SCORE,
+             py::arg("max_rounds") = DEFAULT_MAX_ROUNDS)
         .def("reset", &RummyEnv::reset)
-        .def("step", &RummyEnv::step, "Returns (reward, done) as a tuple.")
+        .def("step", &RummyEnv::step,
+             "Returns (reward, done). done is true only when the game ends (a player reached the target score).")
         .def("is_done", &RummyEnv::is_done)
         .def("get_score", &RummyEnv::get_score)
+        .def("get_round", &RummyEnv::get_round, "Current round number, from 1.")
+        .def("round_ended", &RummyEnv::round_ended, "True if the last step ended a round.")
+        .def("get_target_score", &RummyEnv::get_target_score)
+        .def("get_penalised", &RummyEnv::get_penalised,
+             "Seat that broke the pile-draw obligation and lost the game (0 = none).")
+        .def("get_required_card", &RummyEnv::get_required_card,
+             "Card taken from the pile that must be melded or laid off this turn, or -1.")
         .def("get_legal_actions", &RummyEnv::get_legal_actions)
         .def("get_state", &RummyEnv::get_state)
         .def("get_current_player", &RummyEnv::get_current_player)
@@ -893,8 +940,11 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get", &EnvBatch::get, "Copy of game i.")
         .def("alive", &EnvBatch::alive_mask)
         .def("observe", &EnvBatch::observe, "Returns (states, masks, current_players[N] int32).")
-        .def("step", &EnvBatch::step, "Returns (rewards, dones); finished games are left as they are.")
+        .def("step", &EnvBatch::step,
+             "Returns (rewards, dones, round_ends); finished games are left as they are.")
         .def("scores", &EnvBatch::scores, "Returns [N,2] scores for players 1 and 2.")
+        .def("penalised", &EnvBatch::penalised, "Per game: seat that broke the pile-draw obligation, or 0.")
+        .def("halt", &EnvBatch::halt, py::arg("which"), "Stop stepping the flagged games.")
         .def("randomize_hidden", &EnvBatch::randomize_hidden, py::arg("seeds"))
         .def("randomize_hidden_weighted", &EnvBatch::randomize_hidden_weighted, py::arg("seeds"), py::arg("weights"));
 }

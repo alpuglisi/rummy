@@ -5,10 +5,13 @@ import torch
 
 import rummy_engine
 
-# Observation layout (see rummy_env.h): six 52-card channels then six scalars.
+# Observation layout (see rummy_env.h): six 52-card channels then eight scalars,
+# the first two being own score / target and opponent score / target.
 KNOWN_CARDS = slice(4 * 52, 5 * 52)    # opponent's publicly known hand cards
 UNSEEN_CARDS = slice(5 * 52, 6 * 52)   # deck or opponent's unknown hand
 CHANNELS_END = 6 * 52
+SCORE_SCALARS = 2
+OBS_DIM = CHANNELS_END + SCORE_SCALARS + 6
 
 
 def blank_known(states):
@@ -20,16 +23,24 @@ def blank_known(states):
 
 
 def adapt_obs(states, obs_dim):
-    """Project the engine observation onto an older layout (a checkpoint
-    trained without the unseen channel expects the five channels + scalars).
-    Works on numpy arrays and torch tensors."""
+    """Project the engine observation onto an older layout: checkpoints from
+    before the score scalars expect six channels + six scalars (318), and
+    those from before the unseen channel expect five channels + six scalars
+    (266). Works on numpy arrays and torch tensors."""
     if states.shape[-1] == obs_dim:
         return states
-    if obs_dim == 5 * 52 + 6 and states.shape[-1] == CHANNELS_END + 6:
-        if isinstance(states, np.ndarray):
-            return np.concatenate([states[..., :5 * 52], states[..., CHANNELS_END:]], axis=-1)
-        return torch.cat([states[..., :5 * 52], states[..., CHANNELS_END:]], dim=-1)
-    raise ValueError(f"cannot adapt observation of width {states.shape[-1]} to a model expecting {obs_dim}")
+    if states.shape[-1] != OBS_DIM:
+        raise ValueError(f"cannot adapt observation of width {states.shape[-1]} to a model expecting {obs_dim}")
+    if obs_dim == CHANNELS_END + 6:
+        channels = CHANNELS_END
+    elif obs_dim == 5 * 52 + 6:
+        channels = 5 * 52
+    else:
+        raise ValueError(f"cannot adapt observation of width {states.shape[-1]} to a model expecting {obs_dim}")
+    tail = CHANNELS_END + SCORE_SCALARS
+    if isinstance(states, np.ndarray):
+        return np.concatenate([states[..., :channels], states[..., tail:]], axis=-1)
+    return torch.cat([states[..., :channels], states[..., tail:]], dim=-1)
 
 
 class VectorizedRummyEnv:

@@ -23,7 +23,7 @@ class RummyActorCritic(nn.Module):
     shared_fc1..N so checkpoints from the earlier fixed networks load unchanged.
     """
 
-    def __init__(self, obs_dim=318, action_dim=105, hidden_size=512, num_layers=4, residual=True):
+    def __init__(self, obs_dim=320, action_dim=105, hidden_size=512, num_layers=4, residual=True):
         super().__init__()
         self.obs_dim = obs_dim
         self.num_layers = num_layers

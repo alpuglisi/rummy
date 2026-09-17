@@ -11,11 +11,11 @@ class SearchPolicy:
     """Determinized Monte Carlo search on top of a trained policy.
 
     For each decision: sample `worlds` redeals of the hidden cards, play every
-    candidate action out to the end of the game in each world with the model
-    driving both players, and pick the action with the best mean outcome from
-    the searching player's perspective. Candidate actions are the model's
-    `max_actions` most likely legal moves. All rollouts for all decisions are
-    stepped together in one threaded EnvBatch.
+    candidate action out to the end of the current round in each world with
+    the model driving both players, and pick the action with the best mean
+    outcome: the searcher's score gain over the round minus the opponent's.
+    Candidate actions are the model's `max_actions` most likely legal moves.
+    All rollouts for all decisions are stepped together in one threaded EnvBatch.
     """
 
     needs_env = True
@@ -47,7 +47,7 @@ class SearchPolicy:
         self.agreements = 0          # search picked the model's own top choice
         self.value_gap = 0.0         # mean outcome of search's pick minus the model's pick
         self.rollouts = 0
-        self.rollout_steps = 0       # engine steps played across all rollouts (they run to game end)
+        self.rollout_steps = 0       # engine steps played across all rollouts (they run to the round's end)
 
     def stats(self):
         n = max(self.decisions, 1)
@@ -106,27 +106,31 @@ class SearchPolicy:
 
         batch = rummy_engine.EnvBatch(sims, self.num_threads)
         n = batch.size
-        outcome = np.zeros(n, dtype=np.float64)
-        actor = np.full(n, sim_agent, dtype=np.int32)
-        rewards, dones = batch.step(sim_action)
-        finished = dones.copy()
-        outcome[finished] = rewards[finished]   # the searcher acted, so the reward is already ours
+        start = batch.scores()
+        _, dones, round_ends = batch.step(sim_action)
+        alive = ~(dones | round_ends)
+        batch.halt(~alive)
 
         self.rollouts += n
         self.rollout_steps += n
-        alive = ~finished
         while alive.any():
-            states, masks, players = batch.observe()
+            states, masks, _ = batch.observe()
             idx = np.flatnonzero(alive)
             self.rollout_steps += len(idx)
             actions = np.zeros(n, dtype=np.int64)
             actions[idx] = self._sample(states[idx], masks[idx])
-            actor[idx] = players[idx]
-            rewards, dones = batch.step(actions)
-            just_done = idx[dones[idx]]
-            sign = np.where(actor[just_done] == sim_agent[just_done], 1.0, -1.0)
-            outcome[just_done] = rewards[just_done] * sign
-            alive[just_done] = False
+            _, dones, round_ends = batch.step(actions)
+            alive[idx[(dones | round_ends)[idx]]] = False
+            batch.halt(~alive)
+
+        # Outcome: the searcher's score gain over the round minus the opponent's.
+        gain = batch.scores() - start
+        own = gain[np.arange(n), sim_agent - 1]
+        opp = gain[np.arange(n), 2 - sim_agent]
+        outcome = own - opp
+        # Breaking the pile-draw obligation forfeits the game; score it as a heavy loss.
+        penalised = batch.penalised()
+        outcome = np.where(penalised == sim_agent, -100.0, np.where(penalised != 0, 100.0, outcome))
 
         results = []
         for i in range(len(envs)):

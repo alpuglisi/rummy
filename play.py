@@ -14,9 +14,15 @@ a meld on the table to lay it off, as often as you like. Finally select a
 single card and press D (or the button) to discard it and end your turn. You
 must always keep one card to discard; the only way to go out is to discard
 your last card. The computer melds and lays off automatically, as it was
-trained to. Keys: A toggles the advisor (the search's expected outcome for
-each of your legal moves, assuming you lay down everything you can), N starts
-a new game, Q quits.
+trained to.
+
+Scoring: Ace 1, 2-10 face value, J/Q/K 10, earned as cards go on the table.
+Going out (or the deck running out) ends the round: each player's leftover
+cards are subtracted from their own score, the table is cleared and a new
+round is dealt. The game is won by the first player to reach 500 at the end
+of a round. Keys: A toggles the advisor (the search's expected round outcome
+for each of your legal moves, assuming you lay down everything you can), N
+starts a new game, Q quits.
 """
 import argparse
 import os
@@ -86,7 +92,8 @@ class Game:
     def new_game(self):
         self.env.reset()
         self.known[:] = False
-        self.log = ["New game. You are player 1; you draw first."]
+        self.round_start = (0.0, 0.0)
+        self.log = [f"New game to {self.env.get_target_score()}. You are player 1; you draw first."]
         self.result = None
         self.advice = {}
         self.selected.clear()
@@ -142,35 +149,61 @@ class Game:
         else:
             text = f"discarded {card_name(action - 53)}"
             self.known[action - 53] = False
+        round_no = self.env.get_round()
+        deck_empty = self.obs()[-2] >= 1.0
         reward, done = self.env.step(int(action))
-        self.known &= ~(self.obs()[156:208] == 1.0)   # melded cards have left the opponent's hand
         self.log.append(f"{who} {text}.")
+        if self.env.round_ended():
+            self.end_round(round_no, "Deck ran out" if deck_empty else f"{who} went out")
+        else:
+            self.known &= ~(self.obs()[156:208] == 1.0)   # melded cards have left the opponent's hand
         if done:
-            self.finish(reward, who)
+            self.finish()
         self.refresh_advice()
 
-    def finish(self, reward, actor):
+    def end_round(self, round_no, how):
         s1, s2 = self.env.get_score(1), self.env.get_score(2)
-        if reward == 0:
-            outcome = "Draw"
+        gain_you, gain_cpu = s1 - self.round_start[0], s2 - self.round_start[1]
+        self.round_start = (s1, s2)
+        self.known[:] = False
+        self.selected.clear()
+        self.log.append(f"Round {round_no} over ({how}): you {gain_you:+.0f}, computer {gain_cpu:+.0f}.  "
+                        f"Score {s1:.0f} - {s2:.0f}.")
+
+    def finish(self):
+        s1, s2 = self.env.get_score(1), self.env.get_score(2)
+        penalised = self.env.get_penalised()
+        if penalised == self.human:
+            outcome = "Computer wins: you broke the pile-draw obligation."
+        elif penalised:
+            outcome = "You win: the computer broke the pile-draw obligation."
+        elif s1 == s2:
+            outcome = "Draw."
         else:
-            actor_won = reward > 0
-            you_won = actor_won == (actor == "You")
-            outcome = "You win!" if you_won else "Computer wins."
+            outcome = "You win!" if s1 > s2 else "Computer wins."
         self.result = f"{outcome}  Final score: you {s1:.0f} - computer {s2:.0f}.  Press N for a new game."
         self.log.append(self.result)
 
     def toggle_select(self, card):
         self.selected.symmetric_difference_update({int(card)})
 
+    def obligation_ok(self, cards):
+        """The card taken from the pile must be played before anything else."""
+        required = self.env.get_required_card()
+        return required == -1 or required in cards
+
     def can_meld(self):
-        return len(self.selected) >= 3 and self.env.is_valid_meld(sorted(self.selected))
+        hand = set(int(c) for c in self.hand())
+        return (3 <= len(self.selected) < len(hand) and self.selected <= hand
+                and self.obligation_ok(self.selected) and self.env.is_valid_meld(sorted(self.selected)))
 
     def can_discard(self):
         return len(self.selected) == 1 and self.legal()[53 + next(iter(self.selected))]
 
     def can_lay_off(self, meld_index):
-        if len(self.selected) != 1 or len(self.hand()) < 2:
+        hand = set(int(c) for c in self.hand())
+        if len(self.selected) != 1 or len(hand) < 2 or not self.selected <= hand \
+                or not self.obligation_ok(self.selected):
             return False
         return self.env.can_lay_off(next(iter(self.selected)), self.table()[meld_index])
 
@@ -260,6 +293,8 @@ class View:
         opp_n = g.opponent_size()
         opp_known = np.flatnonzero(g.known)
         self.text(f"Computer  -  {opp_n} cards, score {g.env.get_score(g.computer_seat()):.0f}", 20, 12, self.big)
+        self.text(f"Round {g.env.get_round()}   first to {g.env.get_target_score()}",
+                  WIDTH - 260, 18, self.font, DIM)
         x = 20
         for card in opp_known[:opp_n]:
             self.card(int(card), x, 45); x += 40

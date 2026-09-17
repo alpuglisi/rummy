@@ -26,10 +26,15 @@ const int HAND_SIZE = 7;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
 // Channels: hand, discard presence, discard order, melded board, opponent's
 // publicly known cards, unseen cards (still in the deck or hidden in the
-// opponent's hand); scalars: own hand size, opponent hand size, score
-// difference, then the original three meta flags (turn phase, deck fraction,
-// required meld) which stay at the end since the trainer reads obs[-3].
-const int OBS_SPACE_SIZE = DECK_SIZE * 6 + 6;
+// opponent's hand); scalars: own score / target, opponent score / target,
+// own hand size, opponent hand size, score difference, then the original
+// three meta flags (turn phase, deck fraction, required meld) which stay at
+// the end since the trainer reads obs[-3].
+const int OBS_SPACE_SIZE = DECK_SIZE * 6 + 8;
+const int DEFAULT_TARGET_SCORE = 500;
+// Safety net so a game between two players who never score cannot run
+// forever: after this many rounds the higher score wins.
+const int DEFAULT_MAX_ROUNDS = 100;
 
 typedef std::vector<int> Meld;
 
@@ -48,6 +53,11 @@ struct GameState {
 
     float p1_score;
     float p2_score;
+    float round_start_p1;   // Scores when the current round was dealt
+    float round_start_p2;
+    int round_number;
+    bool round_just_ended;  // The last step ended a round (a new one has been dealt unless the game is over)
+    int penalised_player;   // Seat that broke the pile-draw obligation (0 = none); ends the game
 
     std::vector<int> cached_required_meld; // Caches the meld computed by compute_legal_mask()
 };
@@ -61,6 +71,8 @@ private:
 
     std::vector<float> observation_buffer;
     int manual_meld_player = 0;   // Seat that chooses its own melds (0 = none: everyone auto-melds)
+    int target_score;             // The game ends after the round in which a player reaches this
+    int max_rounds;               // ...or after this many rounds, whichever comes first
 
     void deal_initial_hands();
     void update_observation_buffer();
@@ -90,10 +102,18 @@ private:
     // a meld card breaks the meld, per game rules, and the caller is
     // expected to apply the -50 penalty in that case.
     bool resolve_meld(int player, int discard_card);
-    float settle_terminal(int winner);
+
+    // A game is a sequence of rounds. start_round() reshuffles and deals with
+    // the scores kept; end_round() subtracts each player's leftover hand from
+    // their own score, ends the game if a player has reached target_score,
+    // and otherwise deals the next round. Returns the acting player's reward:
+    // their score gain over the round minus the opponent's, plus +/-100 when
+    // the game ends with a winner.
+    void start_round();
+    float end_round(int acting_player);
 
 public:
-    RummyEnv(uint32_t seed);
+    RummyEnv(uint32_t seed, int target_score = DEFAULT_TARGET_SCORE, int max_rounds = DEFAULT_MAX_ROUNDS);
 
     void reset();
     py::tuple step(int action);
@@ -102,6 +122,12 @@ public:
     bool is_done() const { return state.is_terminal; }
     float get_score(int player) const;
     int get_current_player() const { return state.current_player; }
+    int get_round() const { return state.round_number; }
+    bool round_ended() const { return state.round_just_ended; }
+    int get_target_score() const { return target_score; }
+    int get_penalised() const { return state.penalised_player; }
+    // Card taken from the pile that must be played this turn, or -1.
+    int get_required_card() const { return state.required_meld_card; }
 
     // Redeal the cards the current player cannot see (opponent's unknown hand
     // cards and the undrawn deck) at random. The current player's observation
@@ -215,6 +241,9 @@ public:
     py::tuple observe();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
     py::array_t<float> scores() const;
+    py::array_t<int32_t> penalised() const;
+    // Stop stepping the flagged games (e.g. once their first round is over).
+    void halt(py::array_t<bool, py::array::c_style | py::array::forcecast> which);
     void randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds);
     void randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
                                    py::array_t<float, py::array::c_style | py::array::forcecast> weights);

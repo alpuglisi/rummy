@@ -35,7 +35,8 @@ class DeckOnlyPolicy:
         return actions
 
 
-CARD_POINTS = np.array([15 if r == 0 else 10 if r >= 9 else 5 for r in range(52)])[np.arange(52) % 13]
+# Ace 1, 2-10 face value, court cards 10 (see get_point_value in the engine).
+CARD_POINTS = np.array([1 if r == 0 else 10 if r >= 9 else r + 1 for r in range(13)])[np.arange(52) % 13]
 
 
 class GreedyPolicy:
@@ -80,12 +81,13 @@ class ModelPolicy:
         return actions.cpu().numpy()
 
 
-def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
+def play_matches(agent, opponent, num_games, seed=0, num_threads=0, full_game=False):
     """Agent plays as player 1 in even-indexed games and player 2 in odd ones.
 
-    All games are stepped together in one threaded EnvBatch. Terminal rewards
-    are from the acting player's perspective: >0 the actor won, <0 the actor
-    lost, 0 a draw.
+    All games are stepped together in one threaded EnvBatch. By default each
+    match is a single round: the winner is the player with the higher score
+    when the round ends (someone goes out or the deck runs out). With
+    full_game=True matches run until a player reaches the target score.
     """
     if num_threads <= 0:
         num_threads = os.cpu_count() or 1
@@ -97,9 +99,10 @@ def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
     agent_penalties = 0
     agent_draws = agent_deep_draws = agent_pile_available = 0
     steps = np.zeros(num_games, dtype=np.int64)
-    # Agent's score sampled before its final step: meld points, excluding the
-    # opponent's leftover hand value that settle_terminal() adds at game end.
+    # Agent's score sampled before its final step: points laid on the table,
+    # before the leftover-hand subtraction at the end of the round.
     meld_points = np.zeros(num_games, dtype=np.float64)
+    final_scores = np.zeros((num_games, 2), dtype=np.float64)
 
     while alive.any():
         states, masks, players = batch.observe()
@@ -126,21 +129,27 @@ def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
         agent_pile_available += int((draw_phase & masks[agent_idx, 1:].any(axis=1)).sum())
 
         scores = batch.scores()
-        meld_points[live] = scores[live, agent_player[live] - 1]
-        rewards, dones = batch.step(actions)
+        if not full_game:
+            meld_points[live] = scores[live, agent_player[live] - 1]
+        rewards, dones, round_ends = batch.step(actions)
         steps[live] += 1
 
-        finished = live[dones[live]]
+        over = dones if full_game else (dones | round_ends)
+        finished = live[over[live]]
         if len(finished):
-            actor_is_agent = players[finished] == agent_player[finished]
-            r = rewards[finished]
-            draws += int((r == 0).sum())
-            wins += int(((r != 0) & ((r > 0) == actor_is_agent)).sum())
-            # A -50 with cards still in the deck is the meld-failure penalty; at deck
-            # exhaustion -50 can also be a legitimate score difference.
-            end_states = batch.observe()[0]
-            agent_penalties += int((actor_is_agent & (r == -50) & (end_states[finished, -2] < 1.0)).sum())
+            scores = batch.scores()
+            final_scores[finished] = scores[finished]
+            own = scores[finished, agent_player[finished] - 1]
+            opp = scores[finished, 2 - agent_player[finished]]
+            penalised = batch.penalised()[finished]
+            # Breaking the pile-draw obligation forfeits the game.
+            lost_by_penalty = penalised == agent_player[finished]
+            won_by_penalty = (penalised != 0) & ~lost_by_penalty
+            agent_penalties += int(lost_by_penalty.sum())
+            wins += int((won_by_penalty | ((penalised == 0) & (own > opp))).sum())
+            draws += int(((penalised == 0) & (own == opp)).sum())
             alive[finished] = False
+            batch.halt(~alive)
 
     return {
         "win_rate": wins / num_games,
@@ -148,7 +157,8 @@ def play_matches(agent, opponent, num_games, seed=0, num_threads=0):
         "penalty_rate": agent_penalties / num_games,
         "deep_draw_rate": agent_deep_draws / max(agent_draws, 1),
         "pile_take_rate": agent_deep_draws / max(agent_pile_available, 1),
-        "meld_points": float(meld_points.mean()),
+        "meld_points": float(meld_points.mean()) if not full_game
+                       else float(final_scores[np.arange(num_games), agent_player - 1].mean()),
         "mean_turns": float(steps.mean()) / 2,
     }
 
@@ -165,7 +175,10 @@ def main():
     parser.add_argument("--games", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--greedy", action="store_true", help="argmax actions instead of sampling")
+    parser.add_argument("--full", action="store_true",
+                        help="play full games to the target score instead of single rounds (about 10x slower)")
     args = parser.parse_args()
+    full = args.full
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     baseline = ModelPolicy(load_model(args.checkpoints[0], device), device, args.greedy)
@@ -176,19 +189,21 @@ def main():
     def score(s):
         return s["win_rate"] + 0.5 * s["draw_rate"]
 
-    print(f"baseline: {os.path.basename(args.checkpoints[0])}   "
-          f"(scores count a draw as half a win; pile-take, meld pts and turns are from games vs greedy)")
+    unit = "full games to the target score" if full else "single rounds"
+    points_col = "score" if full else "meld pts"
+    print(f"baseline: {os.path.basename(args.checkpoints[0])}   matches are {unit}\n"
+          f"(scores count a draw as half a win; pile-take, {points_col} and turns are from games vs greedy)")
     print(f"{'checkpoint':<28} {'vs random':>9} {'vs deck':>8} {'vs greedy':>9} {'(blind)':>8} {'vs base':>8} "
-          f"{'penalty':>8} {'pile-take':>10} {'meld pts':>9} {'turns':>6}")
+          f"{'penalty':>8} {'pile-take':>10} {points_col:>9} {'turns':>6}")
     for path in args.checkpoints:
         model = load_model(path, device)
         agent = ModelPolicy(model, device, args.greedy)
         blind = ModelPolicy(model, device, args.greedy, blank_known=True)
-        vs_random = play_matches(agent, random_policy, args.games, args.seed)
-        vs_deck = play_matches(agent, deck_only, args.games, args.seed + 1)
-        vs_greedy = play_matches(agent, greedy, args.games, args.seed + 2)
-        vs_greedy_blind = play_matches(blind, greedy, args.games, args.seed + 2)
-        vs_base = play_matches(agent, baseline, args.games, args.seed + 3)
+        vs_random = play_matches(agent, random_policy, args.games, args.seed, full_game=full)
+        vs_deck = play_matches(agent, deck_only, args.games, args.seed + 1, full_game=full)
+        vs_greedy = play_matches(agent, greedy, args.games, args.seed + 2, full_game=full)
+        vs_greedy_blind = play_matches(blind, greedy, args.games, args.seed + 2, full_game=full)
+        vs_base = play_matches(agent, baseline, args.games, args.seed + 3, full_game=full)
         print(f"{os.path.basename(path):<28} {score(vs_random):>9.1%} {score(vs_deck):>8.1%} "
               f"{score(vs_greedy):>9.1%} {score(vs_greedy_blind):>8.1%} {score(vs_base):>8.1%} "
               f"{vs_greedy['penalty_rate']:>8.1%} {vs_greedy['pile_take_rate']:>10.1%} "
