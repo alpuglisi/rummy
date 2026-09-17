@@ -80,10 +80,21 @@ int RummyEnv::immediate_points(const std::vector<int>& hand, int card) const {
 }
 
 bool RummyEnv::could_go_out(int player, const std::vector<int>& extra) const {
-    RummyEnv sim(*this);
-    for (int c : extra) sim.state.card_locations[c] = static_cast<int8_t>(player);
-    sim.auto_meld(player);
-    return sim.get_hand(player).size() <= 1;
+    // Simulate in place and restore: auto_meld only touches card locations,
+    // the table and the scores, and copying the whole engine (observation
+    // buffer included) per simulated draw was the cost of aux_targets().
+    RummyEnv& self = const_cast<RummyEnv&>(*this);
+    const auto saved_locations = state.card_locations;
+    const auto saved_table = state.table;
+    const float saved_p1 = state.p1_score, saved_p2 = state.p2_score;
+    for (int c : extra) self.state.card_locations[c] = static_cast<int8_t>(player);
+    self.auto_meld(player);
+    const bool out = get_hand(player).size() <= 1;
+    self.state.card_locations = saved_locations;
+    self.state.table = saved_table;
+    self.state.p1_score = saved_p1;
+    self.state.p2_score = saved_p2;
+    return out;
 }
 
 std::vector<std::array<int, 4>> RummyEnv::get_history() const {
@@ -366,8 +377,11 @@ void RummyEnv::update_observation_buffer() {
         float* slot = &observation_buffer[base + (HISTORY_LEN - (n_events - e)) * EVENT_DIM];
         slot[0] = (ev.player != state.current_player) ? 1.0f : 0.0f;
         slot[1 + ev.kind] = 1.0f;
-        if (ev.card >= 0) slot[4 + ev.card] = 1.0f;
-        slot[4 + DECK_SIZE] = static_cast<float>(ev.count) / 10.0f;
+        if (ev.card >= 0) {
+            slot[4 + get_rank(ev.card)] = 1.0f;
+            slot[4 + 13 + get_suit(ev.card)] = 1.0f;
+        }
+        slot[EVENT_DIM - 1] = static_cast<float>(ev.count) / 10.0f;
     }
 
     const float own_score = (state.current_player == 1) ? state.p1_score : state.p2_score;

@@ -7,7 +7,7 @@ class PPOConfig:
     num_steps: int = 128       # Steps per environment before an update (131,072 samples)
     env_threads: int = 0       # C++ threads for stepping envs; 0 = one per CPU core
     blank_known_prob: float = 0.5  # Fraction of games that hide the opponent-known-cards channel
-    obs_dim: int = 1004        # Must match OBS_SPACE_SIZE in rummy_env.h (6 channels + turn history + 8 scalars)
+    obs_dim: int = 584         # Must match OBS_SPACE_SIZE in rummy_env.h (6 channels + turn history + 8 scalars)
     hand_size: int = 7         # Cards dealt per player; a curriculum knob (the engine supports 1..25)
     action_dim: int = 105
     

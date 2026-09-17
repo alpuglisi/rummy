@@ -26,10 +26,10 @@ const int DEFAULT_HAND_SIZE = 7;
 const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discards)
 // Turn history in the observation: the last HISTORY_LEN draw/discard events
 // of the round, oldest first, each encoded as [by opponent, kind one-hot
-// (deck draw, pile take, discard), card one-hot, cards taken / 10]. Empty
-// slots are all zero.
+// (deck draw, pile take, discard), rank one-hot (13), suit one-hot (4),
+// cards taken / 10]. Empty slots are all zero.
 const int HISTORY_LEN = 12;
-const int EVENT_DIM = 1 + 3 + DECK_SIZE + 1;
+const int EVENT_DIM = 1 + 3 + 13 + 4 + 1;
 const int HISTORY_SIZE = HISTORY_LEN * EVENT_DIM;
 // Channels: hand, discard presence, discard order, melded board, opponent's
 // publicly known cards, unseen cards (still in the deck or hidden in the

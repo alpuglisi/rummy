@@ -22,8 +22,8 @@ AUX_DIM = rummy_engine.AUX_SPACE_SIZE
 assert OBS_DIM == CHANNELS_END + HISTORY_LEN * EVENT_DIM + SCALARS
 
 # Event encoding inside the history block: [by opponent, deck draw, pile take,
-# discard, card one-hot (52), cards taken / 10].
-EVENT_OPPONENT, EVENT_PILE_TAKE, EVENT_CARD = 0, 2, slice(4, 4 + 52)
+# discard, rank one-hot (13), suit one-hot (4), cards taken / 10].
+EVENT_OPPONENT, EVENT_PILE_TAKE, EVENT_CARD = 0, 2, slice(4, 4 + 13 + 4)
 
 
 def blank_known(states):
