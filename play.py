@@ -24,7 +24,8 @@ Going out (or the deck running out) ends the round: each player's leftover
 cards are subtracted from their own score, the table is cleared and a new
 round is dealt. The game is won by the first player to reach 500 at the end
 of a round. Keys: A toggles the advisor (the search's expected round outcome
-for each of your legal moves, assuming you lay down everything you can), N
+for each of your legal moves, assuming you lay down everything you can: a
+ranked list appears top right and the best move is framed in green), N
 starts a new game, Q quits.
 """
 import argparse
@@ -49,6 +50,7 @@ GREEN = (30, 100, 60)
 HIGHLIGHT = (255, 215, 0)
 TEXT = (245, 245, 245)
 DIM = (170, 190, 175)
+BEST = (130, 235, 150)
 
 
 def card_name(card):
@@ -136,6 +138,27 @@ class Game:
         self.advice = {}
         if self.show_advice and not self.env.is_done() and self.env.get_current_player() == self.human:
             self.advice = self.advisor.evaluate_actions([self.env])[0]
+
+    def describe_action(self, action):
+        if action == 0:
+            return "Draw from the deck"
+        if action <= 52:
+            pile = self.pile()
+            taken = len(pile) - (action - 1)
+            return f"Take the pile down to {card_name(int(pile[action - 1]))} ({taken} card{'s' if taken > 1 else ''})"
+        return f"Discard {card_name(action - 53)}"
+
+    def advice_rows(self):
+        """Advisor suggestions, best first: (action, description, expected margin, gap to best)."""
+        if not self.advice:
+            return []
+        ranked = sorted(self.advice.items(), key=lambda kv: -kv[1][0])
+        best = ranked[0][1][0]
+        return [(a, self.describe_action(a), v, best - v) for a, (v, _) in ranked]
+
+    def best_action(self):
+        rows = self.advice_rows()
+        return rows[0][0] if rows else None
 
     # --- moves ---------------------------------------------------------------
     def apply(self, action, who):
@@ -264,17 +287,46 @@ class View:
     def text(self, s, x, y, font=None, color=TEXT):
         self.screen.blit((font or self.font).render(s, True, color), (x, y))
 
-    def card(self, card, x, y, face=True, highlight=False, label=None):
+    def card(self, card, x, y, face=True, highlight=False, label=None, best=False):
         img = self.assets.faces[card] if face else self.assets.back
         self.screen.blit(img, (x, y))
         if highlight:
-            pygame.draw.rect(self.screen, HIGHLIGHT, (x - 2, y - 2, CARD_W + 4, CARD_H + 4), 3, border_radius=8)
+            pygame.draw.rect(self.screen, BEST if best else HIGHLIGHT,
+                             (x - 2, y - 2, CARD_W + 4, CARD_H + 4), 3, border_radius=8)
         if label is not None:
             tag = self.small.render(label, True, (20, 20, 20))
             box = tag.get_rect(center=(x + CARD_W // 2, y - 12)).inflate(8, 4)
-            pygame.draw.rect(self.screen, HIGHLIGHT, box, border_radius=4)
+            pygame.draw.rect(self.screen, BEST if best else HIGHLIGHT, box, border_radius=4)
             self.screen.blit(tag, tag.get_rect(center=box.center))
         return pygame.Rect(x, y, CARD_W, CARD_H)
+
+    def advice_label(self, game, action):
+        """Short tag drawn above a card the advisor evaluated, e.g. 'BEST +14' or '+9'."""
+        if action not in game.advice:
+            return None, False
+        value = game.advice[action][0]
+        best = action == game.best_action()
+        return (f"BEST {value:+.0f}" if best else f"{value:+.0f}"), best
+
+    def advisor_panel(self, game, discard):
+        """Ranked, plain-language list of the advisor's suggestions (top right)."""
+        x, y = 700, 40
+        rows = game.advice_rows()
+        self.text("Advisor: expected lead over the computer at the end of this round", x, y, self.small, DIM)
+        y += 20
+        if not rows:
+            self.text("thinking..." if game.show_advice else "", x, y, self.small, DIM)
+            return
+        for rank, (action, text, value, gap) in enumerate(rows[:6], 1):
+            color = BEST if rank == 1 else TEXT
+            note = "best move" if rank == 1 else f"{gap:.0f} pts worse"
+            self.text(f"{rank}. {text}", x, y, self.small, color)
+            self.text(f"{value:+.0f}", x + 330, y, self.small, color)
+            self.text(note, x + 380, y, self.small, DIM if rank > 1 else BEST)
+            y += 18
+        hint = ("Numbers assume you lay down every meld and lay-off you can before discarding."
+                if discard else "Only the model's likeliest moves are rated; unlisted moves were not considered.")
+        self.text(hint, x, y + 2, self.small, DIM)
 
     def draw(self, game):
         g, s = game, self.screen
@@ -313,7 +365,8 @@ class View:
         # Deck + pile (middle)
         deck_left = 52 - int(round(float(g.obs()[-2]) * 52))
         y = 335
-        rect = self.card(0, 20, y, face=False, highlight=human_turn and not discard and legal[0])
+        deck_ok = human_turn and not discard and legal[0]
+        rect = self.card(0, 20, y, face=False, highlight=deck_ok, best=deck_ok and g.best_action() == 0)
         self.text(f"Deck: {deck_left}", 20, y + CARD_H + 6, self.small, DIM)
         if human_turn and not discard and legal[0]:
             self.hit.append((rect, ("action", 0)))
@@ -324,15 +377,14 @@ class View:
         for i, card in enumerate(pile):
             action = 1 + i
             ok = human_turn and not discard and legal[action]
-            label = None
-            if ok and action in g.advice:
-                label = f"{g.advice[action][0]:+.0f}"
-            rect = self.card(int(card), x, y, highlight=ok, label=label)
+            label, best = self.advice_label(g, action) if ok else (None, False)
+            rect = self.card(int(card), x, y, highlight=ok, label=label, best=best)
             if ok:
                 self.hit.append((rect, ("action", action)))
             x += step
         if human_turn and not discard and 0 in g.advice:
-            self.text(f"deck {g.advice[0][0]:+.0f}", 20, y + CARD_H + 24, self.small, HIGHLIGHT)
+            label, best = self.advice_label(g, 0)
+            self.text(f"deck: {label}", 20, y + CARD_H + 24, self.small, BEST if best else HIGHLIGHT)
 
         # Human hand (bottom)
         hand = g.hand()
@@ -343,13 +395,15 @@ class View:
             action = 53 + int(card)
             ok = human_turn and discard and legal[action]
             chosen = int(card) in g.selected
-            label = f"{g.advice[action][0]:+.0f}" if ok and action in g.advice else None
-            rect = self.card(int(card), x, 540 if chosen else 560, highlight=ok, label=label)
+            label, best = self.advice_label(g, action) if ok else (None, False)
+            rect = self.card(int(card), x, 540 if chosen else 560, highlight=ok, label=label, best=best)
             if chosen:
                 pygame.draw.rect(s, (80, 160, 255), rect.inflate(6, 6), 3, border_radius=8)
             if human_turn and discard:
                 self.hit.append((rect, ("select", int(card))))
             x += step
+        if g.show_advice and human_turn:
+            self.advisor_panel(g, discard)
         if human_turn and discard:
             self.button("Meld selected  (M)", WIDTH - 470, 690, g.can_meld(), ("meld", None))
             self.button("Discard selected  (D)", WIDTH - 240, 690, g.can_discard(), ("discard", None))
