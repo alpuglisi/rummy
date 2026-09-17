@@ -81,7 +81,6 @@ class Game:
         self.advisor = SearchPolicy(model, device, worlds=args.worlds, max_actions=6, seed=args.seed + 1)
         self.show_advice = False
         self.advice = {}
-        self.known = np.zeros(52, dtype=bool)   # opponent cards the human has seen them take
         self.selected = set()
         self.log = []
         self.result = None
@@ -91,7 +90,6 @@ class Game:
     # --- state helpers -------------------------------------------------------
     def new_game(self):
         self.env.reset()
-        self.known[:] = False
         self.round_start = (0.0, 0.0)
         self.log = [f"New game to {self.env.get_target_score()}. You are player 1; you draw first."]
         self.result = None
@@ -144,19 +142,14 @@ class Game:
         elif action <= 52:
             taken = pile_before[action - 1:]
             text = f"took the pile down to {card_name(int(pile_before[action - 1]))} ({len(taken)} cards)"
-            if who == "Computer":
-                self.known[taken] = True
         else:
             text = f"discarded {card_name(action - 53)}"
-            self.known[action - 53] = False
         round_no = self.env.get_round()
         deck_empty = self.obs()[-2] >= 1.0
         reward, done = self.env.step(int(action))
         self.log.append(f"{who} {text}.")
         if self.env.round_ended():
             self.end_round(round_no, "Deck ran out" if deck_empty else f"{who} went out")
-        else:
-            self.known &= ~(self.obs()[156:208] == 1.0)   # melded cards have left the opponent's hand
         if done:
             self.finish()
         self.refresh_advice()
@@ -165,7 +158,6 @@ class Game:
         s1, s2 = self.env.get_score(1), self.env.get_score(2)
         gain_you, gain_cpu = s1 - self.round_start[0], s2 - self.round_start[1]
         self.round_start = (s1, s2)
-        self.known[:] = False
         self.selected.clear()
         self.log.append(f"Round {round_no} over ({how}): you {gain_you:+.0f}, computer {gain_cpu:+.0f}.  "
                         f"Score {s1:.0f} - {s2:.0f}.")
@@ -289,16 +281,13 @@ class View:
         legal = g.legal() if human_turn else np.zeros(105, dtype=bool)
         discard = g.phase_is_discard() if human_turn else False
 
-        # Opponent hand (top): face down, known cards face up
+        # Opponent hand (top): always face down, even cards taken from the pile
         opp_n = g.opponent_size()
-        opp_known = np.flatnonzero(g.known)
         self.text(f"Computer  -  {opp_n} cards, score {g.env.get_score(g.computer_seat()):.0f}", 20, 12, self.big)
         self.text(f"Round {g.env.get_round()}   first to {g.env.get_target_score()}",
                   WIDTH - 260, 18, self.font, DIM)
         x = 20
-        for card in opp_known[:opp_n]:
-            self.card(int(card), x, 45); x += 40
-        for _ in range(max(0, opp_n - len(opp_known))):
+        for _ in range(opp_n):
             self.card(0, x, 45, face=False); x += 26
 
         # Table: each meld is a group; a single selected hand card can be laid
