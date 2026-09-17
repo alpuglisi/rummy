@@ -18,6 +18,8 @@ AUX_SLICES = {
     "goes_out": slice(265, 268),       # who ends the round: me, opponent, nobody (3-way CE)
 }
 AUX_OUT = 268
+# Target groups in the order the trainer's per-game dropout mask uses.
+AUX_GROUPS = list(AUX_SLICES)
 
 
 class ResidualBlock(nn.Module):

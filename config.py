@@ -79,6 +79,10 @@ class PPOConfig:
     distill_belief: bool = True      # Deal search worlds from the opponent-hand head once it is useful...
     distill_belief_min_gain: float = 0.10  # ...i.e. once Aux/TopKPrecision exceeds the random baseline by this much
     aux_coef: float = 0.5            # Overall weight of the auxiliary losses; 0 disables them all
+    # At the start of every game each auxiliary target group is switched off
+    # for that game with this probability (its loss is masked out), drawn
+    # fresh from OS entropy, so the trunk cannot lean on any single target.
+    aux_dropout: float = 0.5
     # Per-target weights inside the auxiliary loss (see trainer.aux_losses).
     aux_weights: dict = field(default_factory=lambda: {
         "opponent": 1.0, "next_discard": 0.5, "layoff": 0.5, "takeable": 0.5, "discard_value": 0.5,

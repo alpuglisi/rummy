@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from env.vectorized_env import VectorizedRummyEnv
-from models.ppo_network import RummyActorCritic
+from models.ppo_network import AUX_GROUPS, RummyActorCritic
 from config import PPOConfig
 import glob
 
@@ -34,14 +34,19 @@ class RolloutBuffer:
         self.next_discard = torch.full((cfg.num_steps, cfg.num_envs), -1, dtype=torch.long).to(device)
         self.turns_left = torch.full((cfg.num_steps, cfg.num_envs), -1.0, dtype=torch.float32).to(device)
         self.goes_out = torch.full((cfg.num_steps, cfg.num_envs), -1, dtype=torch.long).to(device)
+        # Which auxiliary target groups are active for the game each state belongs to.
+        self.aux_mask = torch.ones((cfg.num_steps, cfg.num_envs, len(AUX_GROUPS)), dtype=torch.float32).to(device)
         self.step = 0
         self.device = device
 
-    def store(self, state, mask, action, logprob, reward, value, done, valid=None, aux=None, players=None):
+    def store(self, state, mask, action, logprob, reward, value, done, valid=None, aux=None, players=None,
+              aux_mask=None):
         if valid is not None:
             self.valid[self.step] = valid.to(self.device)
         if aux is not None:
             self.aux[self.step] = aux.to(self.device)
+        if aux_mask is not None:
+            self.aux_mask[self.step] = aux_mask
         if players is not None:
             self.players[self.step] = players.to(self.device)
         self.states[self.step] = state.to(self.device)
@@ -103,6 +108,10 @@ class PPOTrainer:
         self.best_step = 0
         self.evals_run = 0
         self.rng = np.random.default_rng()
+        # Separate generator for the per-game auxiliary dropout, seeded from OS
+        # entropy so every game's choice is independent of everything else.
+        self.aux_rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+        self.aux_mask = torch.ones((config.num_envs, len(AUX_GROUPS)), dtype=torch.float32, device=self.device)
         self.last_aux = None
         self.teacher = SearchPolicy(self.model, self.device, worlds=config.distill_worlds,
                                     max_actions=config.distill_actions,
@@ -126,6 +135,15 @@ class PPOTrainer:
         # against each member, for PFSP sampling (kept aligned with self.pool).
         self.opponent = torch.full((config.num_envs,), -1, dtype=torch.long, device=self.device)
         self.opponent_seat = torch.ones(config.num_envs, dtype=torch.int32, device=self.device)
+
+    def resample_aux_mask(self, which):
+        """Draw a fresh set of active auxiliary target groups for the games in `which`
+        (each group is dropped for the whole game with probability aux_dropout)."""
+        n = int(which.sum())
+        if n == 0 or self.cfg.aux_dropout <= 0:
+            return
+        keep = self.aux_rng.random((n, len(AUX_GROUPS))) >= self.cfg.aux_dropout
+        self.aux_mask[which] = torch.as_tensor(keep, dtype=torch.float32, device=self.device)
 
     def pool_win_rates(self):
         """Learner's decayed win rate against each pool member (0.5 until it has played them)."""
@@ -229,6 +247,7 @@ class PPOTrainer:
         aux_targets = self.envs.aux_targets()
         self.round_start = torch.zeros(self.cfg.num_envs, dtype=torch.long, device=self.device)
         self.assign_opponents(torch.ones(self.cfg.num_envs, dtype=torch.bool, device=self.device))
+        self.resample_aux_mask(torch.ones(self.cfg.num_envs, dtype=torch.bool, device=self.device))
 
         global_step = 0
         update = 0
@@ -247,7 +266,8 @@ class PPOTrainer:
                 reward = (reward * self.cfg.reward_scale).to(self.device)
                 next_done = next_done.to(self.device)
 
-                self.buffer.store(state, mask, action, logprob, reward, value, done, valid, aux_targets, players)
+                self.buffer.store(state, mask, action, logprob, reward, value, done, valid, aux_targets, players,
+                                  self.aux_mask)
                 self.backfill_labels(t, action, players, round_ends.to(self.device),
                                      round_outs.to(self.device), next_done)
                 self.update_pool_stats(reward, players, next_done)
@@ -259,6 +279,7 @@ class PPOTrainer:
                 aux_targets = self.envs.aux_targets()
                 if done.any():
                     self.assign_opponents(done)
+                    self.resample_aux_mask(done)
                 global_step += self.cfg.num_envs
 
             t_rollout = time.time()
@@ -383,34 +404,53 @@ class PPOTrainer:
             "seconds": time.time() - t0,
         }
 
-    def aux_losses(self, out, states, targets, next_discard, turns_left, goes_out):
+    def aux_losses(self, out, states, targets, next_discard, turns_left, goes_out, active=None):
         """Auxiliary losses for one minibatch. Returns (weighted sum, per-target stats).
 
         `targets` is the engine's AUX block for each state (see rummy_env.h);
-        the other three are labels backfilled from later steps (-1 = unknown)."""
+        the next three are labels backfilled from later steps (-1 = unknown);
+        `active` [B, len(AUX_GROUPS)] says which target groups count for each
+        sample's game (per-game dropout). Every loss is a per-sample quantity
+        averaged over the samples where its group is active and its label known."""
         w = self.cfg.aux_weights
         hand = states[:, :52]
-        n_hand = hand.sum().clamp(min=1.0)
         stats = {}
-        losses = {}
+        per_sample = {}
+
+        def masked_mean(values, valid):
+            return (values * valid).sum() / valid.sum().clamp(min=1.0)
 
         opp = targets[:, 0:52]
-        losses["opponent"] = F.binary_cross_entropy_with_logits(out["opponent"], opp)
-        losses["layoff"] = F.binary_cross_entropy_with_logits(out["layoff"], targets[:, 52:104])
-        # Only the player's own hand cards can be discarded: mask the rest out.
+        per_sample["opponent"] = F.binary_cross_entropy_with_logits(out["opponent"], opp, reduction="none").mean(1)
+        per_sample["layoff"] = F.binary_cross_entropy_with_logits(out["layoff"], targets[:, 52:104],
+                                                                  reduction="none").mean(1)
+        # Only the player's own hand cards can be discarded: average over those.
+        n_hand = hand.sum(1).clamp(min=1.0)
         takeable = F.binary_cross_entropy_with_logits(out["takeable"], targets[:, 104:156], reduction="none")
-        losses["takeable"] = (takeable * hand).sum() / n_hand
+        per_sample["takeable"] = (takeable * hand).sum(1) / n_hand
         value_err = (out["discard_value"] - targets[:, 156:208]) ** 2
-        losses["discard_value"] = (value_err * hand).sum() / n_hand
+        per_sample["discard_value"] = (value_err * hand).sum(1) / n_hand
         flags = targets[:, [208, 210, 211]]   # opponent holds a meld, can go out next turn, deck completes a meld
-        losses["flags"] = F.binary_cross_entropy_with_logits(out["flags"], flags)
-        losses["hand_points"] = F.mse_loss(out["hand_points"].squeeze(-1), targets[:, 209])
+        per_sample["flags"] = F.binary_cross_entropy_with_logits(out["flags"], flags, reduction="none").mean(1)
+        per_sample["hand_points"] = (out["hand_points"].squeeze(-1) - targets[:, 209]) ** 2
+        known = {}
         if "next_discard" in out:
-            losses["next_discard"] = F.cross_entropy(out["next_discard"], next_discard, ignore_index=-1)
-            known = turns_left >= 0
-            losses["turns_left"] = F.mse_loss(out["turns_left"].squeeze(-1)[known], turns_left[known]) \
-                if known.any() else out["turns_left"].sum() * 0.0
-            losses["goes_out"] = F.cross_entropy(out["goes_out"], goes_out, ignore_index=-1)
+            per_sample["next_discard"] = F.cross_entropy(out["next_discard"], next_discard, ignore_index=-1,
+                                                         reduction="none")
+            known["next_discard"] = (next_discard >= 0).float()
+            per_sample["turns_left"] = (out["turns_left"].squeeze(-1) - turns_left) ** 2
+            known["turns_left"] = (turns_left >= 0).float()
+            per_sample["goes_out"] = F.cross_entropy(out["goes_out"], goes_out, ignore_index=-1, reduction="none")
+            known["goes_out"] = (goes_out >= 0).float()
+
+        losses = {}
+        for i, name in enumerate(AUX_GROUPS):
+            if name not in per_sample:
+                continue
+            valid = known.get(name, torch.ones_like(per_sample[name]))
+            if active is not None:
+                valid = valid * active[:, i]
+            losses[name] = masked_mean(per_sample[name], valid)
         total = sum(w.get(name, 1.0) * l for name, l in losses.items())
 
         with torch.no_grad():
@@ -434,8 +474,9 @@ class PPOTrainer:
                 m = turns_left >= 0
                 stats["TurnsLeftMAE"] = ((out["turns_left"].squeeze(-1) - turns_left).abs() * m).sum() / m.sum().clamp(min=1) * 40
                 stats["CanGoOutAcc"] = ((out["flags"][:, 1] > 0).float() == flags[:, 1]).float().mean()
-                stats["TakeableAcc"] = (((out["takeable"] > 0).float() == targets[:, 104:156]).float() * hand).sum() / n_hand
-                stats["DiscardValueMAE"] = ((out["discard_value"] - targets[:, 156:208]).abs() * hand).sum() / n_hand * 50
+                cards = hand.sum().clamp(min=1.0)
+                stats["TakeableAcc"] = (((out["takeable"] > 0).float() == targets[:, 104:156]).float() * hand).sum() / cards
+                stats["DiscardValueMAE"] = ((out["discard_value"] - targets[:, 156:208]).abs() * hand).sum() / cards * 50
         return total, stats
 
     def optimize(self, advantages, returns, distill=None):
@@ -450,6 +491,7 @@ class PPOTrainer:
         b_next = self.buffer.next_discard.view(-1)
         b_turns = self.buffer.turns_left.view(-1)
         b_out = self.buffer.goes_out.view(-1)
+        b_amask = self.buffer.aux_mask.view(-1, len(AUX_GROUPS))
 
         valid_adv = b_advantages[b_valid > 0]
         b_advantages = (b_advantages - valid_adv.mean()) / (valid_adv.std() + 1e-8)
@@ -494,7 +536,7 @@ class PPOTrainer:
 
                 if self.cfg.aux_coef > 0:
                     aux_loss, stats = self.aux_losses(aux_out, mb_states, b_aux[idx], b_next[idx],
-                                                      b_turns[idx], b_out[idx])
+                                                      b_turns[idx], b_out[idx], b_amask[idx])
                     loss = loss + self.cfg.aux_coef * aux_loss
                     for name, value in stats.items():
                         aux_acc[name] = aux_acc.get(name, 0.0) + value
