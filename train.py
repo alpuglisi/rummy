@@ -44,9 +44,17 @@ def main():
                         help="do not delete checkpoints left by a previous run")
     parser.add_argument("--keep-logs", action="store_true",
                         help="do not delete TensorBoard event files left by a previous run")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="run the optimiser's minibatch losses eagerly instead of through torch.compile")
+    parser.add_argument("--no-cuda-graphs", action="store_true",
+                        help="run the opponent pool's forwards eagerly instead of replaying CUDA graphs")
     args = parser.parse_args()
 
     config = PPOConfig()
+    if args.no_compile:
+        config.compile_optimize = False
+    if args.no_cuda_graphs:
+        config.pool_cuda_graphs = False
 
     if not args.keep_checkpoints:
         clean_checkpoints()

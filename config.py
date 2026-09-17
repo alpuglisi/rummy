@@ -101,3 +101,5 @@ class PPOConfig:
     # System
     device: str = "cuda"
     log_dir: str = "runs/rummy_ppo"   # TensorBoard event files; train.py clears it at the start of a run
+    compile_optimize: bool = True     # torch.compile the per-minibatch loss computation (eager on any failure)
+    pool_cuda_graphs: bool = True     # replay pool members' forwards from captured CUDA graphs (CUDA only; eager on any failure)
