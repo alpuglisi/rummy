@@ -7,7 +7,7 @@ import torch
 
 import rummy_engine
 from env.vectorized_env import adapt_obs, blank_known
-from models.ppo_network import RummyActorCritic
+from models.ppo_network import RummyActorCritic, masked_categorical, sample_categorical
 
 
 class RandomPolicy:
@@ -77,7 +77,7 @@ class ModelPolicy:
         if self.greedy:
             actions = logits.argmax(dim=-1)
         else:
-            actions = torch.distributions.Categorical(logits=logits).sample()
+            actions = sample_categorical(masked_categorical(logits))
         return actions.cpu().numpy()
 
 

@@ -23,7 +23,9 @@ AUX_GROUPS = list(AUX_SLICES)
 CARD_HEADS = ["opponent", "next_discard", "layoff", "takeable", "discard_value"]   # one value per card
 GLOBAL_AUX = 3 + 1 + 1 + 3   # flags, hand_points, turns_left, goes_out
 
+DECK_SIZE = 52
 CARD_FEATURES = 6 + 13 + 4   # six channels + rank one-hot + suit one-hot
+READ_TOKENS = 1 + DECK_SIZE  # global token + card tokens: the only encoder outputs anything reads
 
 
 def sample_categorical(dist):
@@ -40,6 +42,33 @@ def masked_categorical(logits):
     """Categorical over masked logits; argument validation is skipped because
     every check it does syncs the GPU, and the logits come from our own network."""
     return Categorical(logits=logits, validate_args=False)
+
+
+def encoder_layer(layer, x, rows):
+    """One norm_first, relu, dropout-free nn.TransformerEncoderLayer written
+    out from its parameters. The module's own train-mode path spends most of
+    its time on layout copies (in-projection chunk/reshape/transposes and the
+    zero-filled select backwards); this is the same arithmetic without them,
+    including attention's 1/sqrt(head_dim) scale via scaled_dot_product_attention.
+    Only the first `rows` query rows are produced: keys and values still come
+    from every token, so the result is the module's output restricted to
+    those rows."""
+    b, l, d = x.shape
+    attn = layer.self_attn
+    head_dim = d // attn.num_heads
+    h = layer.norm1(x)
+    w, bias = attn.in_proj_weight, attn.in_proj_bias   # packed q, k, v projections
+    if rows == l:
+        q, k, v = F.linear(h, w, bias).split(d, dim=-1)
+    else:
+        q = F.linear(h[:, :rows], w[:d], bias[:d])
+        k, v = F.linear(h, w[d:], bias[d:]).split(d, dim=-1)
+    q = q.view(b, rows, attn.num_heads, head_dim).transpose(1, 2)
+    k = k.view(b, l, attn.num_heads, head_dim).transpose(1, 2)
+    v = v.view(b, l, attn.num_heads, head_dim).transpose(1, 2)
+    a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, rows, d)
+    x = x[:, :rows] + attn.out_proj(a)
+    return x + layer.linear2(F.relu(layer.linear1(layer.norm2(x))))
 
 
 class ResidualBlock(nn.Module):
@@ -149,8 +178,15 @@ class RummyActorCritic(nn.Module):
         events = self.event_embed(events) + self.event_pos
         glob = self.global_embed(state[:, -SCALARS:]).unsqueeze(1) + self.global_pos
         tokens = torch.cat([glob, cards, events], dim=1)
-        out = self.encoder_norm(self.encoder(tokens))
-        return out[:, 0], out[:, 1:53]                                                  # global, cards
+        # self.encoder only holds the parameters (keeps checkpoint keys); the
+        # layers run through encoder_layer. Only the global and card tokens are
+        # read afterwards, so the last layer skips the event rows' queries,
+        # residual and feed-forward.
+        layers = self.encoder.layers
+        for layer in layers[:-1]:
+            tokens = encoder_layer(layer, tokens, tokens.shape[1])
+        out = self.encoder_norm(encoder_layer(layers[-1], tokens, READ_TOKENS))
+        return out[:, 0], out[:, 1:]                                                    # global, cards
 
     @staticmethod
     def pile_slots(state):
