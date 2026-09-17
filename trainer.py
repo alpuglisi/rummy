@@ -111,6 +111,7 @@ class PPOTrainer:
         # Separate generator for the per-game auxiliary dropout, seeded from OS
         # entropy so every game's choice is independent of everything else.
         self.aux_rng = np.random.default_rng(int.from_bytes(os.urandom(8), "little"))
+        self.aux_mask_host = np.ones((config.num_envs, len(AUX_GROUPS)), dtype=np.float32)
         self.aux_mask = torch.ones((config.num_envs, len(AUX_GROUPS)), dtype=torch.float32, device=self.device)
         self.last_aux = None
         self.teacher = SearchPolicy(self.model, self.device, worlds=config.distill_worlds,
@@ -133,48 +134,62 @@ class PPOTrainer:
         self.pool_games = [0.0] * len(self.pool)
         # pool_wins / pool_games: decayed win and game counts of the learner
         # against each member, for PFSP sampling (kept aligned with self.pool).
+        # Per-game bookkeeping (opponent, seat, round start, dropout draws)
+        # lives on the host: it is tiny, and keeping it there means no step
+        # has to wait for the GPU to read it back. Device copies are kept for
+        # the tensors the losses need.
+        self.opponent_host = np.full(config.num_envs, -1, dtype=np.int64)
+        self.opponent_seat_host = np.ones(config.num_envs, dtype=np.int32)
         self.opponent = torch.full((config.num_envs,), -1, dtype=torch.long, device=self.device)
         self.opponent_seat = torch.ones(config.num_envs, dtype=torch.int32, device=self.device)
+        self.round_start = np.zeros(config.num_envs, dtype=np.int64)
 
     def resample_aux_mask(self, which):
         """Draw a fresh set of active auxiliary target groups for the games in `which`
-        (each group is dropped for the whole game with probability aux_dropout)."""
-        n = int(which.sum())
-        if n == 0 or self.cfg.aux_dropout <= 0:
+        (a host bool array; each group is dropped for the whole game with
+        probability aux_dropout)."""
+        envs = np.flatnonzero(which)
+        if len(envs) == 0 or self.cfg.aux_dropout <= 0:
             return
-        keep = self.aux_rng.random((n, len(AUX_GROUPS))) >= self.cfg.aux_dropout
-        self.aux_mask[which] = torch.as_tensor(keep, dtype=torch.float32, device=self.device)
+        keep = self.aux_rng.random((len(envs), len(AUX_GROUPS))) >= self.cfg.aux_dropout
+        self.aux_mask_host[envs] = keep
+        self.aux_mask.copy_(torch.from_numpy(self.aux_mask_host))
 
     def pool_win_rates(self):
         """Learner's decayed win rate against each pool member (0.5 until it has played them)."""
         return [w / g if g >= 1.0 else 0.5 for w, g in zip(self.pool_wins, self.pool_games)]
 
     def assign_opponents(self, which):
-        """Pick a pool opponent (or none) and a seat for the games in `which`."""
-        n = int(which.sum())
-        if n == 0 or not self.pool or self.cfg.pool_fraction <= 0:
-            self.opponent[which] = -1
+        """Pick a pool opponent (or none) and a seat for the games in `which` (a host bool array)."""
+        envs = np.flatnonzero(which)
+        n = len(envs)
+        if n == 0:
             return
-        use_pool = torch.rand(n, device=self.device) < self.cfg.pool_fraction
-        if self.cfg.pool_pfsp:
-            # Prioritised fictitious self-play: favour the members the learner loses to.
-            rates = torch.tensor(self.pool_win_rates(), device=self.device)
-            weights = (1.0 - rates).clamp(min=0.0) ** self.cfg.pool_pfsp_power + 0.05
-            ids = torch.multinomial(weights, n, replacement=True)
+        if not self.pool or self.cfg.pool_fraction <= 0:
+            self.opponent_host[envs] = -1
         else:
-            ids = torch.randint(len(self.pool), (n,), device=self.device)
-        self.opponent[which] = torch.where(use_pool, ids, torch.full_like(ids, -1))
-        self.opponent_seat[which] = torch.randint(1, 3, (n,), device=self.device, dtype=torch.int32)
+            use_pool = self.rng.random(n) < self.cfg.pool_fraction
+            if self.cfg.pool_pfsp:
+                # Prioritised fictitious self-play: favour the members the learner loses to.
+                rates = np.array(self.pool_win_rates())
+                weights = np.clip(1.0 - rates, 0.0, None) ** self.cfg.pool_pfsp_power + 0.05
+                ids = self.rng.choice(len(self.pool), size=n, p=weights / weights.sum())
+            else:
+                ids = self.rng.integers(len(self.pool), size=n)
+            self.opponent_host[envs] = np.where(use_pool, ids, -1)
+            self.opponent_seat_host[envs] = self.rng.integers(1, 3, size=n)
+        self.opponent.copy_(torch.from_numpy(self.opponent_host))
+        self.opponent_seat.copy_(torch.from_numpy(self.opponent_seat_host))
 
     def update_pool_stats(self, reward, players, done, decay=0.995):
-        """Record who won each finished pool game (from the terminal reward's sign)."""
-        finished = done & (self.opponent >= 0)
-        if not finished.any():
-            return
-        actor_is_pool = players[finished] == self.opponent_seat[finished]
-        r = reward[finished]
-        learner_won = torch.where(r == 0, 0.5, ((r > 0) != actor_is_pool).float())
-        for pid, won in zip(self.opponent[finished].tolist(), learner_won.tolist()):
+        """Record who won each finished pool game (from the terminal reward's sign).
+        All three arguments are host arrays."""
+        finished = np.flatnonzero(done & (self.opponent_host >= 0))
+        for e in finished:
+            actor_is_pool = players[e] == self.opponent_seat_host[e]
+            r = reward[e]
+            won = 0.5 if r == 0 else float((r > 0) != actor_is_pool)
+            pid = int(self.opponent_host[e])
             self.pool_games[pid] = self.pool_games[pid] * decay + 1.0
             self.pool_wins[pid] = self.pool_wins[pid] * decay + won
 
@@ -196,17 +211,15 @@ class PPOTrainer:
         When a round ends, every state since it started gets the turns that
         were left and who went out (me / opponent / nobody)."""
         buf = self.buffer
-        discards = action >= 53
-        card = action - 53
+        discards = action >= 53                      # host arrays throughout; device writes use host-built indices
         for k in (2, 3):
             if t - k < 0:
                 break
-            ok = discards & (self.round_start <= t - k)
-            envs = torch.nonzero(ok).squeeze(1)
+            envs = np.flatnonzero(discards & (self.round_start <= t - k))
             if len(envs):
-                buf.next_discard[t - k, envs] = card[envs]
-        ended = round_ends | done
-        for e in torch.nonzero(ended).squeeze(1).tolist():
+                buf.next_discard[t - k, torch.from_numpy(envs).to(self.device)] = \
+                    torch.from_numpy(action[envs] - 53).to(self.device)
+        for e in np.flatnonzero(round_ends | done):
             i0 = int(self.round_start[e])
             steps = torch.arange(i0, t + 1, device=self.device)
             buf.turns_left[i0:t + 1, e] = (t - steps).float() / 2.0 / 40.0
@@ -218,16 +231,18 @@ class PPOTrainer:
             self.round_start[e] = t + 1
 
     @torch.no_grad()
-    def pool_actions(self, action, state, mask, players):
-        """Override the learner's actions where a pool opponent is to move; return the learner-turn mask."""
-        pool_turn = (self.opponent >= 0) & (players == self.opponent_seat)
-        if pool_turn.any():
-            for pid in torch.unique(self.opponent[pool_turn]).tolist():
-                idx = torch.nonzero(pool_turn & (self.opponent == pid)).squeeze(1)
-                model = self.pool[pid]
-                logits, _ = model(adapt_obs(state[idx], model.obs_dim), mask[idx])
-                action[idx] = torch.distributions.Categorical(logits=logits).sample()
-        return ~pool_turn
+    def pool_actions(self, action, state, mask, players, players_host):
+        """Override the learner's actions where a pool opponent is to move; return the learner-turn mask.
+
+        Which games each member controls is worked out from the host copies, so
+        the GPU never has to be read back mid-step."""
+        turn_host = (self.opponent_host >= 0) & (players_host == self.opponent_seat_host)
+        for pid in np.unique(self.opponent_host[turn_host]):
+            idx = torch.from_numpy(np.flatnonzero(turn_host & (self.opponent_host == pid))).to(self.device)
+            model = self.pool[int(pid)]
+            logits, _ = model(adapt_obs(state[idx], model.obs_dim), mask[idx])
+            action[idx] = torch.distributions.Categorical(logits=logits).sample()
+        return ~torch.from_numpy(turn_host).to(self.device)
 
     def anneal_lr(self, global_step):
         cfg = self.cfg
@@ -243,43 +258,48 @@ class PPOTrainer:
         state = state.to(self.device)
         mask = mask.to(self.device)
         done = torch.zeros(self.cfg.num_envs, dtype=torch.bool).to(self.device)
-        players = self.envs.current_players().to(self.device)
+        players_host = self.envs.current_players().numpy()
+        players = torch.from_numpy(players_host).to(self.device)
         aux_targets = self.envs.aux_targets()
-        self.round_start = torch.zeros(self.cfg.num_envs, dtype=torch.long, device=self.device)
-        self.assign_opponents(torch.ones(self.cfg.num_envs, dtype=torch.bool, device=self.device))
-        self.resample_aux_mask(torch.ones(self.cfg.num_envs, dtype=torch.bool, device=self.device))
+        everyone = np.ones(self.cfg.num_envs, dtype=bool)
+        self.assign_opponents(everyone)
+        self.resample_aux_mask(everyone)
 
         global_step = 0
         update = 0
         while global_step < self.cfg.total_timesteps:
             t_start = time.time()
             lr = self.anneal_lr(global_step)
-            learner_steps = 0
-            self.round_start.zero_()
+            learner_steps = torch.zeros((), device=self.device)
+            self.round_start[:] = 0
             for t in range(self.cfg.num_steps):
                 with torch.no_grad():
                     action, logprob, value = self.model.get_action(state, mask)
-                valid = self.pool_actions(action, state, mask, players)
-                learner_steps += int(valid.sum())
+                valid = self.pool_actions(action, state, mask, players, players_host)
+                learner_steps += valid.sum()
 
-                next_state, next_mask, reward, next_done, round_ends, round_outs = self.envs.step(action)
-                reward = (reward * self.cfg.reward_scale).to(self.device)
+                # The one host read per step: the engine needs the actions.
+                action_host = action.cpu().numpy()
+                next_state, next_mask, reward, next_done, round_ends, round_outs = self.envs.step(action_host)
+                reward_host = reward.numpy() * self.cfg.reward_scale
+                done_host = next_done.numpy()
+                reward = torch.from_numpy(reward_host).to(self.device)
                 next_done = next_done.to(self.device)
 
                 self.buffer.store(state, mask, action, logprob, reward, value, done, valid, aux_targets, players,
                                   self.aux_mask)
-                self.backfill_labels(t, action, players, round_ends.to(self.device),
-                                     round_outs.to(self.device), next_done)
-                self.update_pool_stats(reward, players, next_done)
+                self.backfill_labels(t, action_host, players_host, round_ends.numpy(), round_outs.numpy(), done_host)
+                self.update_pool_stats(reward_host, players_host, done_host)
 
                 state = next_state.to(self.device)
                 mask = next_mask.to(self.device)
                 done = next_done
-                players = self.envs.current_players().to(self.device)
+                players_host = self.envs.current_players().numpy()
+                players = torch.from_numpy(players_host).to(self.device)
                 aux_targets = self.envs.aux_targets()
-                if done.any():
-                    self.assign_opponents(done)
-                    self.resample_aux_mask(done)
+                if done_host.any():
+                    self.assign_opponents(done_host)
+                    self.resample_aux_mask(done_host)
                 global_step += self.cfg.num_envs
 
             t_rollout = time.time()
@@ -322,7 +342,7 @@ class PPOTrainer:
                     self.writer.add_scalar("Pool/HardestWinRate", min(rates), global_step)
                     self.writer.add_scalar("Pool/MeanWinRate", sum(rates) / len(rates), global_step)
             self.writer.add_scalar("Pool/LearnerStepFraction",
-                                   learner_steps / (self.cfg.num_steps * self.cfg.num_envs), global_step)
+                                   float(learner_steps) / (self.cfg.num_steps * self.cfg.num_envs), global_step)
             self.writer.add_scalar("Reward/Average_Return", returns.mean().item(), global_step)
 
             self.buffer.clear()

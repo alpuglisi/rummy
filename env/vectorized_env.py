@@ -100,7 +100,9 @@ class VectorizedRummyEnv:
     def step(self, actions):
         """Returns (states, masks, rewards, dones, round_ends, round_outs); round_outs is
         the player who went out where a round ended, 0 otherwise."""
-        states, masks, rewards, dones, round_ends, round_outs = self._env.step(actions.detach().cpu().numpy())
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
+        states, masks, rewards, dones, round_ends, round_outs = self._env.step(actions)
         if dones.any():
             self._resample_blank(dones)
         return (torch.from_numpy(self._apply_blank(states)), torch.from_numpy(masks),
