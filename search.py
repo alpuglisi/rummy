@@ -21,11 +21,18 @@ class SearchPolicy:
     needs_env = True
 
     def __init__(self, model, device, worlds=16, max_actions=4, seed=0, num_threads=0, belief=False,
-                 horizon=0, endgame=True, reward_scale=0.02):
+                 horizon=0, endgame=True, reward_scale=0.02, replies=1, max_sims=160_000):
         self.model = model
         self.device = device
         self.worlds = worlds
         self.max_actions = max_actions
+        # Opponent replies: at the opponent's first draw after the searcher's
+        # turn each rollout branches into their `replies` likeliest legal draws
+        # and the candidate is scored by the worst branch (the opponent picks
+        # the reply that hurts most), so the search looks one opponent decision
+        # deeper than a policy-sampled rollout. 1 = no branching.
+        self.replies = max(1, replies)
+        self.max_sims = max_sims   # rollouts per engine batch; positions are chunked to stay under it
         # Rollouts stop at the round's end, or after `horizon` engine steps when
         # set. With `endgame`, the critic's value of the position where a rollout
         # stops (converted to points with reward_scale) is added to the score
@@ -87,6 +94,22 @@ class SearchPolicy:
 
     def evaluate_actions(self, envs):
         """Return, per env, a dict {action: (mean_outcome, n_rollouts)} for its candidates."""
+        per_env = self.worlds * self.max_actions * self.replies
+        chunk = max(1, self.max_sims // per_env)
+        results = []
+        for i in range(0, len(envs), chunk):
+            results.extend(self._evaluate_chunk(envs[i:i + chunk]))
+        return results
+
+    def _top_legal(self, probs, mask, k):
+        """Up to k legal actions per row, most probable first."""
+        out = []
+        for i in range(len(probs)):
+            legal = np.flatnonzero(mask[i])
+            out.append(legal[np.argsort(-probs[i, legal])][:k])
+        return out
+
+    def _evaluate_chunk(self, envs):
         obs = np.stack([e.get_state() for e in envs])
         mask = np.stack([e.get_legal_actions() for e in envs]).astype(bool)
         probs = torch.softmax(self._logits(obs, mask), dim=-1).cpu().numpy()
@@ -120,6 +143,9 @@ class SearchPolicy:
         needs_value = round_ends & ~dones     # bootstrap from the new round's first position
         steps = np.ones(n, dtype=np.int64)
         boot = np.zeros(n, dtype=np.float64)
+        group = np.arange(n)                  # (env, candidate, world) rollout each sim descends from
+        branched = np.full(n, self.replies <= 1)
+        reply = np.full(n, -1, dtype=np.int64)   # forced next action after branching, -1 = sample
 
         self.rollouts += n
         self.rollout_steps += n
@@ -134,6 +160,7 @@ class SearchPolicy:
                 v = self._values(states[want], masks[want])
                 sign = np.where(players[want] == sim_agent[idx[want]], 1.0, -1.0)
                 boot[idx[want]] = sign * v
+            needs_value[idx[want]] = False
             stop_now = stopped[idx] | at_horizon
             if stop_now.any():
                 halt = np.zeros(n, dtype=bool)
@@ -142,9 +169,36 @@ class SearchPolicy:
             live = idx[~stop_now]
             if len(live) == 0:
                 break
+            live_states, live_masks, live_players = states[~stop_now], masks[~stop_now], players[~stop_now]
+
+            # Branch on the opponent's first draw after the searcher's turn.
+            to_branch = ~branched[live] & (live_players != sim_agent[live]) & (live_states[:, -3] == 0.0)
+            if to_branch.any():
+                probs = torch.softmax(self._logits(live_states[to_branch], live_masks[to_branch]), dim=-1).cpu().numpy()
+                options = self._top_legal(probs, live_masks[to_branch], self.replies)
+                counts = np.ones(n, dtype=np.int32)
+                counts[live[to_branch]] = [len(o) for o in options]
+                branched[live[to_branch]] = True
+                reply_new = np.full(int(counts.sum()), -1, dtype=np.int64)
+                offsets = np.cumsum(counts) - counts
+                for j, o in zip(live[to_branch], options):
+                    reply_new[offsets[j]:offsets[j] + len(o)] = o
+                batch = batch.expand(counts)
+                rep = lambda x: np.repeat(x, counts, axis=0)
+                sim_env, sim_action, sim_agent = rep(sim_env), rep(sim_action), rep(sim_agent)
+                start, game_over, stopped = rep(start), rep(game_over), rep(stopped)
+                needs_value, steps, boot, group, branched = rep(needs_value), rep(steps), rep(boot), rep(group), rep(branched)
+                reply = reply_new
+                n = batch.size
+                self.rollouts += int(counts.sum() - len(counts))
+                continue   # re-observe the expanded batch; forced replies are applied below
+
             self.rollout_steps += len(live)
             actions = np.zeros(n, dtype=np.int64)
-            actions[live] = self._sample(states[~stop_now], masks[~stop_now])
+            sampled = self._sample(live_states, live_masks)
+            forced = reply[live] >= 0
+            actions[live] = np.where(forced, reply[live], sampled)
+            reply[live] = -1
             _, dones, round_ends = batch.step(actions)
             steps[live] += 1
             game_over[live] |= dones[live]
@@ -166,12 +220,20 @@ class SearchPolicy:
         penalised = batch.penalised()
         outcome = np.where(penalised == sim_agent, -100.0, np.where(penalised != 0, 100.0, outcome))
 
+        # The opponent chooses the reply that is worst for the searcher: each
+        # original rollout scores as the minimum over its branches.
+        n_groups = int(group.max()) + 1
+        group_outcome = np.full(n_groups, np.inf)
+        np.minimum.at(group_outcome, group, outcome)
+        first = np.unique(group, return_index=True)[1]
+        g_env, g_action = sim_env[first], sim_action[first]
+
         results = []
         for i in range(len(envs)):
             stats = {}
             for a in candidates[i]:
-                sel = (sim_env == i) & (sim_action == int(a))
-                stats[int(a)] = (float(outcome[sel].mean()), int(sel.sum()))
+                sel = (g_env == i) & (g_action == int(a))
+                stats[int(a)] = (float(group_outcome[sel].mean()), int(sel.sum()))
             results.append(stats)
         return results
 

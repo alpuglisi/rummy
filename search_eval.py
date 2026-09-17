@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--worlds", type=int, default=16)
     parser.add_argument("--actions", type=int, default=4, help="candidate actions per decision")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--replies", type=int, default=2, help="opponent replies branched per rollout (1 = none)")
     parser.add_argument("--belief", action="store_true",
                         help="deal search worlds from the opponent-hand head's beliefs and compare with uniform")
     args = parser.parse_args()
@@ -26,7 +27,7 @@ def main():
     model = load_model(args.checkpoint, device)
     plain = ModelPolicy(model, device)
     search = SearchPolicy(model, device, worlds=args.worlds, max_actions=args.actions, seed=args.seed,
-                          belief=args.belief)
+                          belief=args.belief, replies=args.replies)
     label = f"{'belief' if args.belief else 'uniform'} search({args.worlds} worlds x {args.actions} actions)"
 
     t0 = time.time()
@@ -40,7 +41,8 @@ def main():
     print(f"{label} vs greedy: {score(vs_greedy):.1%}   plain vs greedy: {score(plain_vs_greedy):.1%}")
 
     if args.belief:
-        uniform = SearchPolicy(model, device, worlds=args.worlds, max_actions=args.actions, seed=args.seed + 7)
+        uniform = SearchPolicy(model, device, worlds=args.worlds, max_actions=args.actions, seed=args.seed + 7,
+                               replies=args.replies)
         vs_uniform = play_matches(search, uniform, args.games, args.seed + 2)
         print(f"belief search vs uniform search (same budget): {score(vs_uniform):.1%}")
 

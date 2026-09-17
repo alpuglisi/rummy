@@ -7,14 +7,17 @@ class PPOConfig:
     num_steps: int = 128       # Steps per environment before an update (131,072 samples)
     env_threads: int = 0       # C++ threads for stepping envs; 0 = one per CPU core
     blank_known_prob: float = 0.5  # Fraction of games that hide the opponent-known-cards channel
-    obs_dim: int = 584         # Must match OBS_SPACE_SIZE in rummy_env.h (6 channels + turn history + 8 scalars)
+    obs_dim: int = 1728        # Must match OBS_SPACE_SIZE in rummy_env.h (6 channels + 64-event history + 8 scalars)
     hand_size: int = 7         # Cards dealt per player; a curriculum knob (the engine supports 1..25)
     action_dim: int = 105
     
     # Network
+    arch: str = "tokens"       # "tokens": transformer over card + history tokens (see models/ppo_network.py)
+    token_dim: int = 128       # Token width of the card/history transformer
+    token_layers: int = 4      # Its depth
     hidden_size: int = 512
-    num_layers: int = 4        # Residual blocks in the shared trunk; heads are hidden_size // 2 wide
-    residual: bool = True      # LayerNorm residual trunk; False gives the original plain MLP
+    num_layers: int = 4        # Residual blocks in the trunk after the encoder; heads are hidden_size // 2 wide
+    residual: bool = True      # (flat models only) LayerNorm residual trunk; False gives the original plain MLP
 
     # Training Parameters
     total_timesteps: int = 100_000_000
@@ -66,14 +69,19 @@ class PPOConfig:
     # score-to-500 endgame rather than the round margin alone.
     search_horizon: int = 0
     search_endgame: bool = True
+    # Opponent replies branched at their first draw after the searcher's turn
+    # (the candidate scores as the worst branch); rollouts per engine batch.
+    search_replies: int = 2
+    search_max_sims: int = 160_000
 
     # Expert iteration: every distill_every updates, run the search on live
     # training positions (rollouts always play to the end of the game) and pull
     # the policy toward the search's action distribution.
     distill_every: int = 4
-    distill_positions: int = 256
-    distill_worlds: int = 96       # More worlds, shorter rollouts: the critic values the position at the horizon
+    distill_positions: int = 512
+    distill_worlds: int = 192      # Redeals per position; the critic values the position at the horizon
     distill_horizon: int = 16      # Engine steps (8 turns) per teacher rollout; 0 = play the round out
+    distill_replies: int = 3       # Opponent replies branched per rollout (see search_replies)
     distill_actions: int = 6
     distill_coef: float = 0.5        # Weight of the distillation loss next to the PPO loss; 0 disables
     distill_belief: bool = True      # Deal search worlds from the opponent-hand head once it is useful...

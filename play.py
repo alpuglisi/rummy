@@ -202,9 +202,11 @@ class Game:
     def __init__(self, model, device, args, sprite=None):
         self.env = rummy_engine.RummyEnv(args.seed)
         self.human = 1
+        replies = getattr(args, "replies", 2)
         self.computer = ModelPolicy(model, device) if args.no_search else SearchPolicy(
-            model, device, worlds=args.worlds, max_actions=args.actions, seed=args.seed)
-        self.advisor = SearchPolicy(model, device, worlds=args.worlds, max_actions=6, seed=args.seed + 1)
+            model, device, worlds=args.worlds, max_actions=args.actions, seed=args.seed, replies=replies)
+        self.advisor = SearchPolicy(model, device, worlds=args.worlds, max_actions=6, seed=args.seed + 1,
+                                    replies=replies)
         self.show_advice = False
         self.advice = {}
         self.selected = set()
@@ -693,6 +695,8 @@ def main():
                         help="model to play against (default: the trainer's best checkpoint)")
     parser.add_argument("--worlds", type=int, default=64)
     parser.add_argument("--actions", type=int, default=6)
+    parser.add_argument("--replies", type=int, default=2,
+                        help="opponent replies the search branches on (1 = none; higher is stronger and slower)")
     parser.add_argument("--seed", type=int, default=None,
                         help="random by default; set to replay the same deals and search worlds")
     parser.add_argument("--no-search", action="store_true", help="computer plays the plain policy")

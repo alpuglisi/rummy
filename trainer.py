@@ -98,7 +98,8 @@ class PPOTrainer:
         self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
                                        blank_known_prob=config.blank_known_prob, hand_size=config.hand_size)
         self.model = RummyActorCritic(config.obs_dim, config.action_dim, config.hidden_size,
-                                      config.num_layers, config.residual).to(self.device)
+                                      config.num_layers, config.residual, arch=config.arch,
+                                      token_dim=config.token_dim, token_layers=config.token_layers).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
         self.buffer = RolloutBuffer(config, self.device)
 
@@ -118,7 +119,8 @@ class PPOTrainer:
                                     max_actions=config.distill_actions,
                                     seed=int(self.rng.integers(0, 2**31)),
                                     horizon=config.distill_horizon, endgame=config.search_endgame,
-                                    reward_scale=config.reward_scale)
+                                    reward_scale=config.reward_scale, replies=config.distill_replies,
+                                    max_sims=config.search_max_sims)
 
         # Opponent pool: frozen policies; each game is either pure self-play
         # (opponent -1) or has one pool member controlling one seat.
@@ -654,7 +656,8 @@ class PPOTrainer:
         search = SearchPolicy(self.model, self.device, worlds=cfg.search_worlds,
                               max_actions=cfg.search_actions, seed=global_step,
                               horizon=cfg.search_horizon, endgame=cfg.search_endgame,
-                              reward_scale=cfg.reward_scale)
+                              reward_scale=cfg.reward_scale, replies=cfg.search_replies,
+                              max_sims=cfg.search_max_sims)
         t0 = time.time()
         vs_plain = play_matches(search, plain, cfg.search_eval_games, seed=global_step + 4, hand_size=cfg.hand_size)
         vs_greedy = play_matches(search, GreedyPolicy(global_step), cfg.search_eval_games, seed=global_step + 5,

@@ -1057,6 +1057,28 @@ void EnvBatch::halt(py::array_t<bool, py::array::c_style | py::array::forcecast>
     for (int i = 0; i < size(); i++) if (w[i]) alive[i] = 0;
 }
 
+std::unique_ptr<EnvBatch> EnvBatch::expand(py::array_t<int32_t, py::array::c_style | py::array::forcecast> repeats) const {
+    if (repeats.ndim() != 1 || repeats.shape(0) != size()) {
+        throw std::invalid_argument("repeats must have one entry per environment");
+    }
+    const int32_t* rep = repeats.data();
+    std::vector<RummyEnv> copies;
+    size_t total = 0;
+    for (int i = 0; i < size(); i++) total += std::max(0, rep[i]);
+    copies.reserve(total);
+    std::vector<uint8_t> alive_copy;
+    alive_copy.reserve(total);
+    for (int i = 0; i < size(); i++) {
+        for (int r = 0; r < rep[i]; r++) {
+            copies.push_back(envs[i]);
+            alive_copy.push_back(alive[i]);
+        }
+    }
+    std::unique_ptr<EnvBatch> out(new EnvBatch(std::move(copies), pool ? pool->size() : 1));
+    out->alive = alive_copy;
+    return out;
+}
+
 py::array_t<int32_t> EnvBatch::penalised() const {
     py::array_t<int32_t> out(size());
     int32_t* o = out.mutable_data();
@@ -1178,6 +1200,8 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("scores", &EnvBatch::scores, "Returns [N,2] scores for players 1 and 2.")
         .def("penalised", &EnvBatch::penalised, "Per game: seat that broke the pile-draw obligation, or 0.")
         .def("halt", &EnvBatch::halt, py::arg("which"), "Stop stepping the flagged games.")
+        .def("expand", &EnvBatch::expand, py::arg("repeats"),
+             "New batch with game i repeated repeats[i] times, halted state included.")
         .def("randomize_hidden", &EnvBatch::randomize_hidden, py::arg("seeds"))
         .def("randomize_hidden_weighted", &EnvBatch::randomize_hidden_weighted, py::arg("seeds"), py::arg("weights"));
 }

@@ -27,8 +27,9 @@ const int ACTION_SPACE_SIZE = 105; // 1 (Deck) + 52 (Discard Draws) + 52 (Discar
 // Turn history in the observation: the last HISTORY_LEN draw/discard events
 // of the round, oldest first, each encoded as [by opponent, kind one-hot
 // (deck draw, pile take, discard), rank one-hot (13), suit one-hot (4),
-// cards taken / 10]. Empty slots are all zero.
-const int HISTORY_LEN = 12;
+// cards taken / 10]. Empty slots are all zero. 64 events is 32 turns, which
+// covers essentially every round in full.
+const int HISTORY_LEN = 64;
 const int EVENT_DIM = 1 + 3 + 13 + 4 + 1;
 const int HISTORY_SIZE = HISTORY_LEN * EVENT_DIM;
 // Channels: hand, discard presence, discard order, melded board, opponent's
@@ -300,6 +301,9 @@ public:
     py::array_t<int32_t> penalised() const;
     // Stop stepping the flagged games (e.g. once their first round is over).
     void halt(py::array_t<bool, py::array::c_style | py::array::forcecast> which);
+    // A new batch with game i repeated repeats[i] times (in order), for
+    // branching rollouts at a decision point.
+    std::unique_ptr<EnvBatch> expand(py::array_t<int32_t, py::array::c_style | py::array::forcecast> repeats) const;
     void randomize_hidden(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds);
     void randomize_hidden_weighted(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
                                    py::array_t<float, py::array::c_style | py::array::forcecast> weights);
