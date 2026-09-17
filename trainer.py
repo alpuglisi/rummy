@@ -74,6 +74,9 @@ class PPOTrainer:
     def __init__(self, config: PPOConfig):
         self.cfg = config
         self.device = torch.device(config.device)
+        # TF32 matmuls: free speed on Ampere+ for these linear layers at no cost to PPO.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         
         self.envs = VectorizedRummyEnv(config.num_envs, config.env_threads,
                                        blank_known_prob=config.blank_known_prob)
@@ -302,11 +305,9 @@ class PPOTrainer:
         b_advantages = (b_advantages - valid_adv.mean()) / (valid_adv.std() + 1e-8)
 
         num_samples = b_states.shape[0]
-        total_a_loss = 0
-        total_c_loss = 0
-        total_d_loss = 0
-        total_aux_loss = 0
-        aux_hits = aux_total = aux_baseline = 0.0
+        # Running statistics stay on the device; one host read at the end
+        # instead of a GPU sync per minibatch.
+        acc = torch.zeros(7, device=self.device)   # actor, critic, distill, aux, hits, total, baseline
         batches = 0
         distill_batch = min(self.cfg.batch_size, len(distill["states"])) if distill is not None else 0
 
@@ -344,7 +345,7 @@ class PPOTrainer:
                     mb_opp = b_opp[idx]
                     aux_loss = F.binary_cross_entropy_with_logits(aux_logits, mb_opp)
                     loss = loss + self.cfg.aux_coef * aux_loss
-                    total_aux_loss += aux_loss.item()
+                    acc[3] += aux_loss.detach()
                     with torch.no_grad():
                         # Precision of the top-k predicted cards, k = opponent hand size, against a
                         # random guess among the cards that could be in their hand.
@@ -353,9 +354,9 @@ class PPOTrainer:
                         rank_ok = (torch.arange(26, device=self.device)[None, :] < k[:, None]).float()
                         hits = (mb_opp.gather(1, top) * rank_ok).sum(dim=1)
                         candidates = mb_states[:, KNOWN_CARDS].sum(dim=1) + mb_states[:, UNSEEN_CARDS].sum(dim=1)
-                        aux_hits += hits.sum().item()
-                        aux_total += k.sum().item()
-                        aux_baseline += (k * k / candidates.clamp(min=1)).sum().item()
+                        acc[4] += hits.sum()
+                        acc[5] += k.sum()
+                        acc[6] += (k * k / candidates.clamp(min=1)).sum()
 
                 if distill is not None:
                     d_idx = torch.randint(len(distill["states"]), (distill_batch,), device=self.device)
@@ -364,17 +365,18 @@ class PPOTrainer:
                     d_logp = F.log_softmax(d_logits, dim=-1).clamp(min=-1e4)
                     distill_loss = -(distill["targets"][d_idx] * d_logp).sum(dim=-1).mean()
                     loss = loss + self.cfg.distill_coef * distill_loss
-                    total_d_loss += distill_loss.item()
+                    acc[2] += distill_loss.detach()
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
 
-                total_a_loss += actor_loss.item()
-                total_c_loss += critic_loss.item()
+                acc[0] += actor_loss.detach()
+                acc[1] += critic_loss.detach()
                 batches += 1
 
+        total_a_loss, total_c_loss, total_d_loss, total_aux_loss, aux_hits, aux_total, aux_baseline = acc.tolist()
         aux = {
             "loss": total_aux_loss / batches,
             "precision": aux_hits / max(aux_total, 1.0),
@@ -387,24 +389,21 @@ class PPOTrainer:
         agent = ModelPolicy(self.model, self.device)
         n = self.cfg.eval_games
 
+        # Deck-only and the blind greedy match were dropped: the first is a
+        # guaranteed win under round scoring and the second tracks the sighted
+        # score within noise, so they cost a third of the eval for nothing.
         vs_random = play_matches(agent, RandomPolicy(global_step), n, seed=global_step)
-        vs_deck = play_matches(agent, DeckOnlyPolicy(global_step), n, seed=global_step + 1)
         vs_greedy = play_matches(agent, GreedyPolicy(global_step), n, seed=global_step + 3)
         greedy_score = vs_greedy["win_rate"] + 0.5 * vs_greedy["draw_rate"]
-        blind = ModelPolicy(self.model, self.device, blank_known=True)
-        vs_greedy_blind = play_matches(blind, GreedyPolicy(global_step), n, seed=global_step + 3)
-        blind_score = vs_greedy_blind["win_rate"] + 0.5 * vs_greedy_blind["draw_rate"]
         self.writer.add_scalar("Eval/WinRate_vs_Random", vs_random["win_rate"], global_step)
-        self.writer.add_scalar("Eval/WinRate_vs_DeckOnly", vs_deck["win_rate"], global_step)
         self.writer.add_scalar("Eval/Score_vs_Greedy", greedy_score, global_step)
-        self.writer.add_scalar("Eval/Score_vs_Greedy_Blind", blind_score, global_step)
         self.writer.add_scalar("Eval/PenaltyRate", vs_greedy["penalty_rate"], global_step)
         self.writer.add_scalar("Eval/DeepDrawRate", vs_greedy["deep_draw_rate"], global_step)
         self.writer.add_scalar("Eval/PileTakeRate", vs_greedy["pile_take_rate"], global_step)
         self.writer.add_scalar("Eval/MeldPoints", vs_greedy["meld_points"], global_step)
         self.writer.add_scalar("Eval/MeanTurns", vs_greedy["mean_turns"], global_step)
-        line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | vs deck-only {vs_deck['win_rate']:.1%} | "
-                f"vs greedy {greedy_score:.1%} (blind {blind_score:.1%}) | pile-take {vs_greedy['pile_take_rate']:.1%} | "
+        line = (f"  Eval: vs random {vs_random['win_rate']:.1%} | "
+                f"vs greedy {greedy_score:.1%} | pile-take {vs_greedy['pile_take_rate']:.1%} | "
                 f"meld pts {vs_greedy['meld_points']:.1f} | {vs_greedy['mean_turns']:.1f} turns")
 
         # Win rate against a snapshot of this policy from frozen_refresh evals ago;

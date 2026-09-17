@@ -84,44 +84,33 @@ class SearchPolicy:
 
         # One rollout per (env, world, candidate). Worlds are built once per env
         # and copied per candidate so every candidate faces the same redeals.
-        sims, sim_env, sim_action, sim_agent = [], [], [], []
-        for i, env in enumerate(envs):
-            agent = env.get_current_player()
-            for _ in range(self.worlds):
-                world = env.clone()
-                world.set_manual_meld(0)   # simulated players all auto-meld, as in training
-                seed = int(self.rng.integers(0, 2**31))
-                if beliefs is not None:
-                    world.randomize_hidden_weighted(seed, beliefs[i])
-                else:
-                    world.randomize_hidden(seed)
-                for a in candidates[i]:
-                    sims.append(world.clone())
-                    sim_env.append(i)
-                    sim_action.append(int(a))
-                    sim_agent.append(agent)
-        sim_env = np.array(sim_env)
-        sim_action = np.array(sim_action, dtype=np.int64)
-        sim_agent = np.array(sim_agent, dtype=np.int32)
+        # The engine builds the whole batch in one call (order: env, world, candidate).
+        repeats = np.array([len(c) for c in candidates], dtype=np.int32)
+        seeds = np.array([[int(self.rng.integers(0, 2**31)) for _ in range(self.worlds)]
+                          for _ in envs], dtype=np.uint32)
+        agents = np.array([e.get_current_player() for e in envs], dtype=np.int32)
+        per_env = self.worlds * repeats
+        sim_env = np.repeat(np.arange(len(envs)), per_env)
+        sim_agent = agents[sim_env]
+        sim_action = np.concatenate([np.tile(np.asarray(c, dtype=np.int64), self.worlds) for c in candidates])
 
-        batch = rummy_engine.EnvBatch(sims, self.num_threads)
+        batch = rummy_engine.EnvBatch.for_search(envs, repeats, seeds, beliefs, self.num_threads)
         n = batch.size
         start = batch.scores()
         _, dones, round_ends = batch.step(sim_action)
-        alive = ~(dones | round_ends)
-        batch.halt(~alive)
+        batch.halt(dones | round_ends)
 
         self.rollouts += n
         self.rollout_steps += n
-        while alive.any():
-            states, masks, _ = batch.observe()
-            idx = np.flatnonzero(alive)
+        while True:
+            states, masks, _, idx = batch.observe_alive()
+            if len(idx) == 0:
+                break
             self.rollout_steps += len(idx)
             actions = np.zeros(n, dtype=np.int64)
-            actions[idx] = self._sample(states[idx], masks[idx])
+            actions[idx] = self._sample(states, masks)
             _, dones, round_ends = batch.step(actions)
-            alive[idx[(dones | round_ends)[idx]]] = False
-            batch.halt(~alive)
+            batch.halt(dones | round_ends)
 
         # Outcome: the searcher's score gain over the round minus the opponent's.
         gain = batch.scores() - start

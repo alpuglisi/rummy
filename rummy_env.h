@@ -234,11 +234,25 @@ private:
 
 public:
     EnvBatch(const std::vector<RummyEnv>& sources, int num_threads);
+    EnvBatch(std::vector<RummyEnv>&& sources, int num_threads);
+
+    // Build the rollout batch for a determinized search in one call: for each
+    // source game, `worlds` copies with the hidden cards redealt from seeds[i, w]
+    // (weighted by weights[i] when given), each repeated repeats[i] times, one
+    // per candidate action. Order: source, world, candidate. Every copy
+    // auto-melds for both seats.
+    static std::unique_ptr<EnvBatch> for_search(
+        const std::vector<RummyEnv>& sources,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> repeats,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
+        py::object weights, int num_threads);
 
     int size() const { return static_cast<int>(envs.size()); }
     RummyEnv get(int i) const { return envs.at(i); }
     py::array_t<bool> alive_mask() const;
     py::tuple observe();
+    // Observation for the live games only: (states, masks, players, indices).
+    py::tuple observe_alive();
     py::tuple step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> actions);
     py::array_t<float> scores() const;
     py::array_t<int32_t> penalised() const;

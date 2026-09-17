@@ -781,6 +781,78 @@ EnvBatch::EnvBatch(const std::vector<RummyEnv>& sources, int num_threads)
     pool = make_pool(num_threads, static_cast<int>(envs.size()));
 }
 
+EnvBatch::EnvBatch(std::vector<RummyEnv>&& sources, int num_threads)
+    : envs(std::move(sources)), alive(envs.size(), 1) {
+    if (envs.empty()) throw std::invalid_argument("EnvBatch needs at least one environment");
+    for (size_t i = 0; i < envs.size(); i++) alive[i] = envs[i].is_done() ? 0 : 1;
+    pool = make_pool(num_threads, static_cast<int>(envs.size()));
+}
+
+std::unique_ptr<EnvBatch> EnvBatch::for_search(
+        const std::vector<RummyEnv>& sources,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> repeats,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> seeds,
+        py::object weights, int num_threads) {
+    const int n = static_cast<int>(sources.size());
+    if (repeats.ndim() != 1 || repeats.shape(0) != n) {
+        throw std::invalid_argument("repeats must have one entry per source game");
+    }
+    if (seeds.ndim() != 2 || seeds.shape(0) != n) {
+        throw std::invalid_argument("seeds must be [num_sources, worlds]");
+    }
+    const int worlds = static_cast<int>(seeds.shape(1));
+    const float* w = nullptr;
+    py::array_t<float, py::array::c_style | py::array::forcecast> weights_arr;
+    if (!weights.is_none()) {
+        weights_arr = weights.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+        if (weights_arr.ndim() != 2 || weights_arr.shape(0) != n || weights_arr.shape(1) != DECK_SIZE) {
+            throw std::invalid_argument("weights must be [num_sources, 52]");
+        }
+        w = weights_arr.data();
+    }
+    const int32_t* rep = repeats.data();
+    const uint32_t* sd = seeds.data();
+
+    std::vector<RummyEnv> sims;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += static_cast<size_t>(worlds) * std::max(0, rep[i]);
+    sims.reserve(total);
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < worlds; k++) {
+            RummyEnv world = sources[i];
+            world.set_manual_meld(0);   // simulated players all auto-meld, as in training
+            if (w) world.randomize_hidden_weighted(sd[i * worlds + k], w + i * DECK_SIZE);
+            else world.randomize_hidden(sd[i * worlds + k]);
+            for (int r = 0; r < rep[i]; r++) sims.push_back(world);
+        }
+    }
+    return std::unique_ptr<EnvBatch>(new EnvBatch(std::move(sims), num_threads));
+}
+
+py::tuple EnvBatch::observe_alive() {
+    std::vector<int> idx;
+    idx.reserve(envs.size());
+    for (int i = 0; i < size(); i++) if (alive[i]) idx.push_back(i);
+    const int k = static_cast<int>(idx.size());
+    py::array_t<float> states({k, OBS_SPACE_SIZE});
+    py::array_t<bool> masks({k, ACTION_SPACE_SIZE});
+    py::array_t<int32_t> players(k);
+    py::array_t<int64_t> indices(k);
+    float* s = states.mutable_data();
+    bool* m = masks.mutable_data();
+    int32_t* p = players.mutable_data();
+    int64_t* ix = indices.mutable_data();
+    {
+        py::gil_scoped_release release;
+        parallel_for(pool.get(), k, [&](int j) {
+            write_observation(envs[idx[j]], j, s, m);
+            p[j] = envs[idx[j]].get_current_player();
+            ix[j] = idx[j];
+        });
+    }
+    return py::make_tuple(states, masks, players, indices);
+}
+
 py::array_t<bool> EnvBatch::alive_mask() const {
     py::array_t<bool> out(size());
     bool* o = out.mutable_data();
@@ -940,6 +1012,12 @@ PYBIND11_MODULE(rummy_engine, m) {
         .def("get", &EnvBatch::get, "Copy of game i.")
         .def("alive", &EnvBatch::alive_mask)
         .def("observe", &EnvBatch::observe, "Returns (states, masks, current_players[N] int32).")
+        .def("observe_alive", &EnvBatch::observe_alive,
+             "Live games only: (states[K,obs], masks[K,105], current_players[K], indices[K]).")
+        .def_static("for_search", &EnvBatch::for_search, py::arg("sources"), py::arg("repeats"),
+                    py::arg("seeds"), py::arg("weights") = py::none(), py::arg("num_threads") = 1,
+                    "Rollout batch for determinized search: per source, worlds x repeats copies with hidden "
+                    "cards redealt (order: source, world, repeat).")
         .def("step", &EnvBatch::step,
              "Returns (rewards, dones, round_ends); finished games are left as they are.")
         .def("scores", &EnvBatch::scores, "Returns [N,2] scores for players 1 and 2.")
