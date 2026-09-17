@@ -39,6 +39,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 
 import numpy as np
@@ -216,6 +217,11 @@ class Game:
         # passed: a 2-6 s pause before its turn so it appears to think, then a
         # short one between its draw and its discard so both can be followed.
         self.computer_due = None
+        # The computer's actual decision (a real search, possibly several
+        # seconds) runs on this background thread so it never blocks the
+        # window; see tick_computer/_start_computer_search.
+        self._search_thread = None
+        self._search_result = None
         # The cat reacts to how the computer's prospects change; values are the
         # critic's, converted to points (see value_for_computer).
         self.sprite = sprite
@@ -228,6 +234,14 @@ class Game:
 
     # --- state helpers -------------------------------------------------------
     def new_game(self):
+        if self._search_thread is not None:
+            # Wait for the in-flight search to finish before reset() mutates
+            # the same env object it's reading; a brief block here only
+            # happens if new game is started mid-think, unlike the freeze
+            # this replaces, which happened on every single computer turn.
+            self._search_thread.join()
+            self._search_thread = None
+            self._search_result = None
         self.env.reset()
         self.round_start = (0.0, 0.0)
         self.log = [f"New game to {self.env.get_target_score()}. You are player 1; you draw first."]
@@ -487,13 +501,25 @@ class Game:
             self.computer_step()
 
     def tick_computer(self, now):
-        """Called every frame: schedule and play the computer's moves with pauses."""
+        """Called every frame: schedule and play the computer's moves with pauses.
+
+        The pause is cosmetic, but the actual decision can be a real search
+        taking several seconds; it runs on a background thread (started by
+        _start_computer_search) so the window keeps redrawing and handling
+        input instead of freezing for however long that takes."""
         if not self.computer_to_move():
             self.computer_due = None
             if self.sprite and self.sprite.mood == "contemplation":
                 self.sprite.set_mood(None)
             if self.turn_value is None and not self.env.is_done():
                 self.turn_value = self.value_for_computer()   # the human's turn is starting
+            return
+        if self._search_thread is not None:
+            if self._search_thread.is_alive():
+                return   # still thinking; let this frame render as normal
+            action, self._search_thread, self._search_result = self._search_result, None, None
+            self.apply(action, "Computer")
+            self.computer_due = None
             return
         if self.computer_due is None:
             drawing = not self.phase_is_discard()
@@ -505,8 +531,25 @@ class Game:
                 if self.sprite:
                     self.sprite.set_mood("contemplation")   # think while the pause runs
         elif now >= self.computer_due:
-            self.computer_step()
-            self.computer_due = None
+            self._start_computer_search()
+
+    def _start_computer_search(self):
+        """Compute the computer's next action on a background thread.
+
+        act_envs/act only read self.env (search clones it for simulation
+        rather than mutating it), so this is safe to run while the main
+        thread keeps rendering; new_game() joins this thread before reset()
+        touches the same env object, so the two can never race. The result
+        is a single int written once by this thread and read once by the
+        main thread's tick_computer, which needs no lock under the GIL."""
+        def run():
+            if hasattr(self.computer, "act_envs"):
+                action = int(self.computer.act_envs([self.env])[0])
+            else:
+                action = int(self.computer.act(self.obs()[None], self.legal()[None])[0])
+            self._search_result = action
+        self._search_thread = threading.Thread(target=run, daemon=True)
+        self._search_thread.start()
 
     def computer_seat(self):
         return 2 if self.human == 1 else 1
