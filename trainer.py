@@ -385,6 +385,15 @@ class PPOTrainer:
             self.pool_graphs.pop(0)   # its captured graphs go with it
             self.pool_wins.pop(0)
             self.pool_games.pop(0)
+            # Games already running hold the index of their opponent, so the
+            # shift has to be applied to them too: without it every game keeps
+            # its old number and silently starts playing the next member up,
+            # and its result is then credited to that member's PFSP record.
+            # Games whose opponent was the one evicted fall back to self-play.
+            evicted = self.opponent_host == 0
+            self.opponent_host[self.opponent_host > 0] -= 1
+            self.opponent_host[evicted] = -1
+            self.opponent.copy_(self.opponent_stage, non_blocking=True)
 
     def backfill_labels(self, t, action, players, round_ends, round_outs, done):
         """Fill in labels that depend on what happens next.
