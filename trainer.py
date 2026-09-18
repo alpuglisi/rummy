@@ -552,7 +552,7 @@ class PPOTrainer:
                 self.writer.add_scalar("Search/TeacherBelief", float(self.teacher.belief), global_step)
             t_distill = time.time()
 
-            actor_loss, critic_loss, distill_loss, aux = self.optimize(advantages, returns, distill)
+            actor_loss, critic_loss, distill_loss, aux, policy = self.optimize(advantages, returns, distill)
             self.last_aux = aux
             t_optimize = time.time()
 
@@ -561,6 +561,8 @@ class PPOTrainer:
             if distill is not None:
                 self.writer.add_scalar("Loss/Distill", distill_loss, global_step)
             self.writer.add_scalar("Train/LearningRate", lr, global_step)
+            for name, value in policy.items():
+                self.writer.add_scalar(f"Policy/{name}", value, global_step)
             if self.cfg.aux_coef > 0:
                 for name, value in aux.items():
                     if name not in ("precision", "baseline"):
@@ -736,8 +738,9 @@ class PPOTrainer:
                          d_states=None, d_masks=None, d_targets=None):
         """Forward and losses of one minibatch, as a pure function of tensors so
         it can be compiled. Returns (loss, actor, critic, distill, aux stats,
-        logits finite); the last four are detached, distill is None without
-        distillation inputs. The backward and the optimiser step stay outside."""
+        logits finite, policy stats); everything after `loss` is detached and
+        distill is None without distillation inputs. The backward and the
+        optimiser step stay outside."""
         cfg = self.cfg
         n_valid = mb_valid.sum().clamp(min=1.0)
 
@@ -761,6 +764,18 @@ class PPOTrainer:
 
         loss = actor_loss + (cfg.vf_coef * critic_loss) - (cfg.ent_coef * entropy)
 
+        # Diagnostics over the learner's own moves only, same masking as the
+        # losses: entropy says whether the policy has gone deterministic, and
+        # the clip fraction / approximate KL say whether each update is too
+        # aggressive (pinned at the clip boundary) or too timid (~0).
+        with torch.no_grad():
+            clipped = ((ratio - 1.0).abs() > cfg.clip_coef).float()
+            pstats = {
+                "entropy": entropy.detach(),
+                "clip_fraction": (clipped * mb_valid).sum() / n_valid,
+                "approx_kl": (((ratio - 1.0) - logratio) * mb_valid).sum() / n_valid,
+            }
+
         stats = {}
         if cfg.aux_coef > 0:
             aux_loss, stats = self.aux_losses(aux_out, mb_states, mb_aux, mb_next, mb_turns, mb_out, mb_amask)
@@ -775,7 +790,7 @@ class PPOTrainer:
             loss = loss + cfg.distill_coef * distill_loss
             distill_loss = distill_loss.detach()
 
-        return loss, actor_loss.detach(), critic_loss.detach(), distill_loss, stats, finite
+        return loss, actor_loss.detach(), critic_loss.detach(), distill_loss, stats, finite, pstats
 
     def compile_losses(self):
         """torch.compile minibatch_losses (the ~700 small kernels of a minibatch
@@ -836,7 +851,8 @@ class PPOTrainer:
         num_samples = b_states.shape[0]
         # Running statistics stay on the device; one host read at the end
         # instead of a GPU sync per minibatch.
-        acc = torch.zeros(3, device=self.device)   # actor, critic, distill
+        # actor, critic, distill, entropy, clip fraction, approximate KL
+        acc = torch.zeros(6, device=self.device)
         finite = torch.ones((), dtype=torch.bool, device=self.device)
         aux_acc = {}
         batches = 0
@@ -851,7 +867,7 @@ class PPOTrainer:
                     d_idx = torch.randint(len(distill["states"]), (distill_batch,), device=self.device)
                     extra = (distill["states"][d_idx], distill["masks"][d_idx], distill["targets"][d_idx])
 
-                loss, actor_loss, critic_loss, distill_loss, stats, ok = self.losses(
+                loss, actor_loss, critic_loss, distill_loss, stats, ok, pstats = self.losses(
                     b_states[idx], b_masks[idx], b_actions[idx], b_logprobs[idx], b_advantages[idx],
                     b_returns[idx], b_valid[idx], b_aux[idx], b_next[idx], b_turns[idx], b_out[idx],
                     b_amask[idx], *extra)
@@ -867,17 +883,21 @@ class PPOTrainer:
                     acc[2] += distill_loss
                 acc[0] += actor_loss
                 acc[1] += critic_loss
+                acc[3] += pstats["entropy"]
+                acc[4] += pstats["clip_fraction"]
+                acc[5] += pstats["approx_kl"]
                 finite &= ok
                 batches += 1
 
         if not bool(finite):
             raise RuntimeError("non-finite policy logits during optimisation")
-        total_a_loss, total_c_loss, total_d_loss = acc.tolist()
+        total_a_loss, total_c_loss, total_d_loss, ent, clipf, kl = acc.tolist()
         sums = {k: float(v) for k, v in aux_acc.items()}
         aux = {k: v / batches for k, v in sums.items() if not k.startswith("_")}
         aux["precision"] = sums.get("_hits", 0.0) / max(sums.get("_total", 0.0), 1.0)
         aux["baseline"] = sums.get("_baseline", 0.0) / max(sums.get("_total", 0.0), 1.0)
-        return total_a_loss / batches, total_c_loss / batches, total_d_loss / batches, aux
+        policy = {"Entropy": ent / batches, "ClipFraction": clipf / batches, "ApproxKL": kl / batches}
+        return total_a_loss / batches, total_c_loss / batches, total_d_loss / batches, aux, policy
 
     def evaluate(self, global_step):
         self.model.eval()
