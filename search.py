@@ -237,6 +237,7 @@ class SearchPolicy:
         group = np.arange(n)                  # (env, candidate, world) rollout each sim descends from
         branched = np.full(n, self.replies <= 1)
         reply = np.full(n, -1, dtype=np.int64)   # forced next action after branching, -1 = sample
+        rank = np.zeros(n, dtype=np.int64)       # which of the opponent's replies a branch took
 
         self.rollouts += n
         self.rollout_steps += n
@@ -288,14 +289,19 @@ class SearchPolicy:
                 counts[rows] = valid.sum(1)
                 branched[rows] = True
                 offsets = np.cumsum(counts) - counts
+                slots = offsets[rows][:, None] + np.arange(options.shape[1])
                 reply_new = np.full(int(counts.sum()), -1, dtype=np.int64)
-                reply_new[(offsets[rows][:, None] + np.arange(options.shape[1]))[valid]] = options[valid]
+                reply_new[slots[valid]] = options[valid]
+                # Which preference rank each new branch represents, so the
+                # reduction below can average a rank over worlds before the min.
+                rank_new = np.repeat(rank, counts)
+                rank_new[slots[valid]] = np.broadcast_to(np.arange(options.shape[1]), options.shape)[valid]
                 batch = batch.expand(counts)
                 rep = lambda x: np.repeat(x, counts, axis=0)
                 sim_env, sim_action, sim_agent = rep(sim_env), rep(sim_action), rep(sim_agent)
                 start, game_over, stopped = rep(start), rep(game_over), rep(stopped)
                 needs_value, steps, boot, group, branched = rep(needs_value), rep(steps), rep(boot), rep(group), rep(branched)
-                reply = reply_new
+                reply, rank = reply_new, rank_new
                 n = batch.size
                 self.rollouts += int(counts.sum() - len(counts))
                 # The expanded batch's observation is the row-repeat of the
@@ -334,7 +340,20 @@ class SearchPolicy:
         gain = batch.scores() - start
         own = gain[np.arange(n), sim_agent - 1]
         opp = gain[np.arange(n), 2 - sim_agent]
-        outcome = own - opp + boot
+        realized = own - opp
+        if self.endgame:
+            # A rollout cut at the horizon has not been paid for its round yet:
+            # the engine pays the round's margin only at end_round, measured
+            # from the round's start, so the critic's value where the rollout
+            # stops already prices every point melded since then -- including
+            # the ones melded inside the horizon window. Adding the mid-round
+            # score delta on top would count those twice. Only a rollout that
+            # actually reached a round or game boundary has a realized margin;
+            # for the rest the bootstrap is the whole estimate. (Everything the
+            # root had already banked is common to all candidates, so it
+            # cancels when they are compared.)
+            realized = np.where(stopped, realized, 0.0)
+        outcome = realized + boot
         if game_over.any():
             final = batch.scores()
             mine = final[np.arange(n), sim_agent - 1]
@@ -344,20 +363,39 @@ class SearchPolicy:
         penalised = batch.penalised()
         outcome = np.where(penalised == sim_agent, -100.0, np.where(penalised != 0, 100.0, outcome))
 
-        # The opponent chooses the reply that is worst for the searcher: each
-        # original rollout scores as the minimum over its branches.
-        n_groups = int(group.max()) + 1
-        group_outcome = np.full(n_groups, np.inf)
-        np.minimum.at(group_outcome, group, outcome)
-        first = np.unique(group, return_index=True)[1]
-        g_env, g_action = sim_env[first], sim_action[first]
+        # The opponent picks the reply that hurts the searcher most, so a
+        # candidate should score as the worst of their replies. Taking that
+        # minimum over the branches of a single world does not measure it: each
+        # branch is one stochastic rollout, so the minimum of k of them is
+        # dominated by sampling noise and sinks as k grows -- which would
+        # penalise a candidate merely for leaving the opponent more legal draws,
+        # something the candidate itself controls. Every candidate faces the
+        # same redeals, so average a reply RANK over the worlds first and take
+        # the opponent's worst rank of those averages instead.
+        key = sim_env.astype(np.int64) * 256 + sim_action     # actions are < 256
+        order = np.argsort(key, kind="stable")
+        skey, sgroup, srank, souts = key[order], group[order], rank[order], outcome[order]
+        uniq = np.unique(skey)
+        lo = np.searchsorted(skey, uniq, side="left")
+        hi = np.searchsorted(skey, uniq, side="right")
+        seg = {int(k): (int(x), int(y)) for k, x, y in zip(uniq, lo, hi)}
 
         results = []
         for i in range(len(envs)):
             stats = {}
             for a in candidates[i]:
-                sel = (g_env == i) & (g_action == int(a))
-                stats[int(a)] = (float(group_outcome[sel].mean()), int(sel.sum()))
+                a = int(a)
+                x, y = seg[i * 256 + a]
+                worlds, w_idx = np.unique(sgroup[x:y], return_inverse=True)
+                by_rank = np.full((len(worlds), self.replies), np.nan)
+                by_rank[w_idx, srank[x:y]] = souts[x:y]
+                # A world whose rollout ended before the opponent could reply,
+                # or where they had fewer legal draws than `replies`, carries
+                # its last branch into the ranks it never reached.
+                for r in range(1, self.replies):
+                    missing = np.isnan(by_rank[:, r])
+                    by_rank[missing, r] = by_rank[missing, r - 1]
+                stats[a] = (float(by_rank.mean(axis=0).min()), len(worlds))
             results.append(stats)
         return results
 
