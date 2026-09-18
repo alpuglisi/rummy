@@ -218,8 +218,9 @@ class PPOTrainer:
                                  f"it was saved under an older observation layout and cannot be used to warm-start "
                                  f"the live policy (adapt_obs is only for opponents, not the model being trained)")
             print(f"Warm-started the live policy from {config.init_checkpoint} (arch={self.model.arch}); "
-                 f"config.arch/hidden_size/token_dim/token_layers are ignored for it. The optimizer, opponent "
-                 f"pool and learning-rate schedule all start fresh.")
+                 f"config.arch/hidden_size/token_dim/token_layers are ignored for it. It also stands in as the "
+                 f"incumbent best, so {config.best_checkpoint} is only written once the run beats it. The optimizer, "
+                 f"opponent pool and learning-rate schedule all start fresh.")
         else:
             self.model = RummyActorCritic(config.obs_dim, config.action_dim, config.hidden_size,
                                           config.num_layers, config.residual, arch=config.arch,
@@ -229,7 +230,12 @@ class PPOTrainer:
 
         self.writer = SummaryWriter(log_dir=config.log_dir)
         self.frozen_model = None
-        self.best_model = None      # incumbent best policy (see config.best_checkpoint)
+        # Incumbent best policy (see config.best_checkpoint). A fresh run has
+        # none, so its first evaluation promotes whatever it has. A warm start
+        # already begins from a trained policy: start it as the incumbent, or
+        # the first evaluation would overwrite best.pth with an early, weaker
+        # policy and throw away the checkpoint the run was seeded from.
+        self.best_model = copy.deepcopy(self.model).eval() if config.init_checkpoint else None
         self.best_step = 0
         self.evals_run = 0
         self.rng = np.random.default_rng()
